@@ -1,0 +1,17 @@
+﻿varname,long_name,units,type
+lon,longitude,degrees_east,float32
+lat,latitude,degrees_north,float32
+time,time,-,int16
+frp_total,Total FRP in grid cell,MW,float32
+frp_mean,Grid-cell mean FRP (area-normalized then scaled to cell area),MW,float32
+frp_std,Standard deviation of FRP detections in grid cell,MW,float32
+frp_max,Maximum FRP detection in grid cell,MW,float32
+frp_density,FRP density over detected pixel area,MW km-2,float32
+pixel_area_total,Total detected pixel area in grid cell,km2,float32
+pixel_area_mean,Mean detected pixel area,km2,float32
+area,Grid cell area,km2,float32
+nobs,Number of detections in grid cell,#,int16
+confidence,NGFS confidence flag (min value within nobs),#,int16
+quality_flag,NGFS quality flag (1 or min within nobs),#,int16
+type,NGFS detection type flag (1 or min within nobs),#,int16
+known_incident_type,NGFS known incident type (mode within nobs),#,int16
