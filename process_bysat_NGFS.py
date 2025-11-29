@@ -526,10 +526,6 @@ bounding_box    = np.array([-138.0, -57.0, 20.0, 54.0])
 # R               = 0.01 # Resolution in degrees
 R               = 0.03
 
-goes_w_lon = -136.9
-goes_e_lon =  -75.2
-
-
 # Create output directories:
 checkDir(path_csv)
 checkDir(path_netcdf)

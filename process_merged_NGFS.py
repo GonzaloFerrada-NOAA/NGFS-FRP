@@ -7,7 +7,7 @@ import pandas as pd
 import xarray as xr
 import numpy as np
 from pathlib import Path
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 
 # Functions:
 def checkDir(path_check):
@@ -50,7 +50,6 @@ def add_grid_cell_area(
     area = (radius_km**2) * np.abs(np.sin(lat2) - np.sin(lat1)) * dlon
     df[area_col] = area
     return df
-
 
 def snap2grid(df, bounding_box, R,
                  xcol='longitude', ycol='latitude',
@@ -204,9 +203,9 @@ def hourly_regrid_metrics(df, bounding_box, R):
     # now add grid cell area
     add_grid_cell_area(df, R, lat_col='latitude', area_col='grid_area_km2')
     
-    # Denormalize FRP:
+    # FRP density:
     # df["frp"] = df["frp"] / df["grid_area_km2"]
-    df["frp"] = df["frp"] * df["grid_area_km2"]
+    # df["frp"] = df["frp"] * df["grid_area_km2"]
     
     keys = ['hour', 'latitude', 'longitude']
 
@@ -218,11 +217,11 @@ def hourly_regrid_metrics(df, bounding_box, R):
     # metrics + flags (same rules you asked for)
     named_aggs = {
         'frp_total':        ('frp', 'sum'),
-        'frp_mean':         ('frp', 'mean'),
         'frp_std':          ('frp', lambda s: s.astype(float).std(ddof=0)),
         'frp_max':          ('frp', 'max'),
         'pixel_area_total': ('pixel_area', 'sum'),
         'pixel_area_mean':  ('pixel_area', 'mean'),
+        "grid_area_km2":    ("grid_area_km2", "first"),   # <- needed for scaling
         'confidence':       ('confidence', _prefer_one_else_min),
         'quality_flag':     ('quality_flag', _prefer_one_zero_min),
         'type':             ('type', _prefer_one_zero_min),
@@ -235,6 +234,16 @@ def hourly_regrid_metrics(df, bounding_box, R):
     out = (agg_df.merge(sizes, on=keys, how='left')
                  .sort_values(keys, kind='mergesort')
                  .reset_index(drop=True))
+    
+    # ---- QFED-style mean FRP for the grid cell ----
+    if {"frp_total", "pixel_area_total", "grid_area_km2"}.issubset(out.columns):
+        denom = out["pixel_area_total"].astype(float).to_numpy()
+        frp_total = out["frp_total"].astype(float).to_numpy()
+        grid_area = out["grid_area_km2"].astype(float).to_numpy()
+
+        out["frp_mean"]    = np.where(denom > 0, (frp_total / denom) * grid_area, 0.0)
+        out["frp_density"] = np.where(denom > 0, frp_total / denom, 0.0)
+        
     return out  # one row per (hour, lat, lon) with metrics and nobs
 
 def lonlat_axes(bounding_box, R):
@@ -289,6 +298,9 @@ def write_hour_grid_nc(df_hour, out_dir, R, bounding_box):
     if df_hour.empty:
         return
     hour = df_hour['hour'].iloc[0]             # right-edge time label (HH)
+    # ensure timezone-naive UTC before converting to numpy datetime64
+    if hasattr(hour, 'tzinfo') and hour.tzinfo is not None:
+        hour = hour.tz_convert('UTC').tz_localize(None)
     ymdh = hour.strftime('%Y%m%d_%H')
     Rout = f"{R}".replace('.', 'p')
     fn = Path(out_dir) / f'NGFS_{ymdh}Z_{Rout}.nc'
@@ -306,13 +318,45 @@ def write_hour_grid_nc(df_hour, out_dir, R, bounding_box):
                'bounding_box': np.array(bounding_box, dtype='float32'),
                'description': 'Hourly metrics on regular lat/lon grid'}
     )
-    # print(ds)
     
     # Add grid area:
     garea = eartharea(lon, lat)
     ds['area'] = (('lat', 'lon'), garea.astype('float32'))
     ds['area'].attrs['units'] = 'km2'
     ds['area'].attrs['long_name'] = 'grid cell area'
+    
+    # 1) Variable attributes
+    var_attrs = {
+        "frp_total":        {"long_name": "Total FRP in grid cell", "units": "MW"},
+        "frp_mean":         {"long_name": "Grid-cell mean FRP (area-normalized then scaled to cell area)", "units": "MW"},
+        "frp_std":          {"long_name": "Standard deviation of FRP detections in grid cell", "units": "MW"},
+        "frp_max":          {"long_name": "Maximum FRP detection in grid cell", "units": "MW"},
+        "frp_density":      {"long_name": "FRP density over detected pixel area", "units": "MW km-2"},
+        "pixel_area_total": {"long_name": "Total detected pixel area in grid cell", "units": "km2"},
+        "pixel_area_mean":  {"long_name": "Mean detected pixel area", "units": "km2"},
+        "nobs":             {"long_name": "Number of detections in grid cell", "units": "1"},
+        "area":             {"long_name": "Grid cell area", "units": "km2"},
+    }
+
+    for v, a in var_attrs.items():
+        if v in ds:
+            ds[v].attrs.update(a)
+
+    # Coordinate attrs
+    ds["lat"].attrs.update({"long_name": "latitude",  "units": "degrees_north"})
+    ds["lon"].attrs.update({"long_name": "longitude", "units": "degrees_east"})
+    ds["time"].attrs.update({"long_name": "time"})
+
+    # 2) Global attributes
+    ds.attrs.update({
+        "title": "NGFS hourly gridded FRP metrics",
+        "author": "Gonzalo A. Ferrada (gonzalo.ferrada@noaa.gov)",
+        "institution": "CIRES/CU Boulder, GSL/NOAA",
+        "source": "NGFS point detections (https://cimss.ssec.wisc.edu/ngfs/)",
+        "history": f"created {datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')}",
+        "creation_date_utc": datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ'),
+        # "Conventions": "CF-1.8",
+    })
     
     
     # NetCDF4 + deflate level 7 + chunking
@@ -332,8 +376,8 @@ def write_hour_grid_nc(df_hour, out_dir, R, bounding_box):
     
 # ======================================================================
 # User defined:
-DATE1 = '2025-08-14'
-DATE2 = '2025-09-11'
+DATE1 = '2025-09-05'
+DATE2 = '2025-09-10'
 dates = pd.date_range(start=DATE1, end=DATE2, freq='D')
 
 # Save options:
@@ -399,17 +443,11 @@ for d in dates:
         df.dropna(subset=cols_to_check, inplace=True)
         
         # Normalize frp by pixel area:
-        # df["frp"] = df["frp"] * df["pixel_area"] # MW * KM2
-        df["frp"] = df["frp"] / df["pixel_area"] # MW/km2 (frp density)
+        # df["frp"] = df["frp"] / df["pixel_area"] # MW/km2 (frp density)
+        # GAF removed because this is wrong. First need to SUM all FRP and SUM all pixel areas
+        # per grid cell, then compute FRP density as total FRP / total pixel area
         
         # Keep only columns we use:
-        # df = df[[
-        #     "acq_date_time", "latitude", "longitude", "frp",
-        #     "latitude_c1", "longitude_c1", "latitude_c2", "longitude_c2",
-        #     "latitude_c3", "longitude_c3", "latitude_c4", "longitude_c4",
-        #     "pixel_area", "confidence", "quality_flag", "type",
-        #     "known_incident_name", "known_incident_type"
-        # ]]
         df = df[[
             "acq_date_time", "latitude", "longitude", "frp",
             "pixel_area", "confidence", "quality_flag", "type",
@@ -450,17 +488,6 @@ for d in dates:
         # Regrid and aggregate by hour:
         df_hourly = hourly_regrid_metrics(df, bounding_box, R)
         
-        # # Rename not tested GAF:
-        # df_hourly = df_hourly.rename(columns={
-        #     "acq_date_time": "datetime",
-        #     "latitude": "lat",
-        #     "longitude": "lon",
-        #     "frp_mean": "FRP_MEAN",
-        #     "frp_total" : "FRP_TOT",
-        #     "frp_std" : "FRP_STD",
-        #     "frp_max" : "FRP_MAX",
-        # })
-        
         # Save
         if save_csv:
             file_out = f"{path_csv}/ngfs_gridded_{R}_{sdate}.csv"
@@ -472,8 +499,9 @@ for d in dates:
                 write_hour_grid_nc(df_h, path_netcdf, R, bounding_box)
                 # exit(0)
             
-        msg("done!")
+        
         # print(df.dtypes)
+        
         
 
     except FileNotFoundError:
@@ -483,4 +511,5 @@ for d in dates:
         print("Please install them using: pip install pandas matplotlib cartopy")
     except Exception as e:
         print(f"An error occurred: {e}")
-
+        
+msg("done!")
