@@ -250,15 +250,15 @@ def hourly_regrid_metrics(df, bounding_box, R):
     return out  # one row per (hour, lat, lon) with metrics and nobs
 
 DEFAULT_FILL_VALUE = -999.0
+_META_TABLE: pd.DataFrame | None = None
 
 
-FLAG_VARIABLES = {
-    "confidence",
-    "nobs",
-    "quality_flag",
-    "type",
-    "known_incident_type",
-}
+def get_meta_table() -> pd.DataFrame:
+    global _META_TABLE
+    if _META_TABLE is None:
+        meta_path = Path(__file__).with_name("ngfs_nc_variables.csv")
+        _META_TABLE = pd.read_csv(meta_path).set_index("varname")
+    return _META_TABLE
 
 
 def lonlat_axes(bounding_box, R):
@@ -310,6 +310,79 @@ def eartharea(lon, lat):
     
     return garea
 
+
+def write_ngfs_netcdf(ds: xr.Dataset, out_path: Path | str, meta: pd.DataFrame | None = None):
+    """
+    Apply NGFS variable metadata, enforce dtypes/fill values, and write NetCDF.
+    """
+    if meta is None:
+        meta = get_meta_table()
+    ds = ds.copy()
+    var_fill_values: dict[str, float] = {}
+
+    # Coordinate attributes/dtypes (skip time to preserve CF handling)
+    for coord in ds.coords:
+        if coord == "time":
+            continue
+        if coord in meta.index:
+            row = meta.loc[coord]
+            dtype = str(row.get("type", "")).strip()
+            if dtype:
+                ds[coord] = ds[coord].astype(dtype)
+            long_name = row.get("long_name")
+            units = row.get("units")
+            if isinstance(long_name, str) and long_name:
+                ds[coord].attrs["long_name"] = long_name
+            if isinstance(units, str) and units:
+                ds[coord].attrs["units"] = units
+
+    # Data variable metadata, dtype enforcement, and fill values
+    for var in ds.data_vars:
+        row = meta.loc[var] if var in meta.index else None
+        target_dtype = ""
+        if row is not None:
+            target_dtype = str(row.get("type", "")).strip()
+        if not target_dtype:
+            target_dtype = str(ds[var].dtype)
+        is_int = target_dtype.startswith("int")
+        fill_value = int(DEFAULT_FILL_VALUE) if is_int else float(DEFAULT_FILL_VALUE)
+        ds[var] = ds[var].fillna(fill_value).astype(target_dtype)
+        var_fill_values[var] = fill_value
+
+        if row is not None:
+            long_name = row.get("long_name")
+            units = row.get("units")
+            if isinstance(long_name, str) and long_name:
+                ds[var].attrs["long_name"] = long_name
+            if isinstance(units, str) and units:
+                ds[var].attrs["units"] = units
+
+    # Encoding dictionary
+    enc: dict[str, dict[str, Any]] = {}
+    for var, da in ds.data_vars.items():
+        if da.ndim == 3:
+            chunks = (1, 512, 512)
+        elif da.ndim == 2:
+            chunks = (512, 512)
+        else:
+            chunks = None
+        entry: dict[str, Any] = dict(zlib=True, complevel=7, dtype=str(da.dtype))
+        if chunks:
+            entry["chunksizes"] = chunks
+        if var in var_fill_values:
+            entry["_FillValue"] = var_fill_values[var]
+        enc[var] = entry
+
+    # Coordinate encodings (default float32 for lat/lon if present)
+    if "lat" in ds.coords:
+        enc["lat"] = {"dtype": str(ds["lat"].dtype)}
+    if "lon" in ds.coords:
+        enc["lon"] = {"dtype": str(ds["lon"].dtype)}
+
+    out_path = Path(out_path)
+    ds.to_netcdf(out_path, format="NETCDF4", encoding=enc)
+    return out_path
+
 def write_hour_grid_nc(df_hour, out_dir, R, bounding_box, sat_label=""):
     if df_hour.empty:
         return None
@@ -325,11 +398,6 @@ def write_hour_grid_nc(df_hour, out_dir, R, bounding_box, sat_label=""):
     suffix = f"_{sat_label.strip()}" if sat_label.strip() else ""
     fn = Path(out_dir) / f'NGFS_{ymdh}Z_{Rout}{suffix}.nc'
     
-    # Load metadata CSV (varname,long_name,units,type)
-    # Place ngfs_nc_variables.csv next to this script
-    meta_path = Path(__file__).with_name("ngfs_nc_variables.csv")
-    meta = pd.read_csv(meta_path).set_index("varname")
-
     lon, lat = lonlat_axes(bounding_box, R)
     fields = [c for c in [
             'frp_total', 'frp_mean', 'frp_std', 'frp_max',
@@ -356,23 +424,7 @@ def write_hour_grid_nc(df_hour, out_dir, R, bounding_box, sat_label=""):
     # 2-D grid area:
     ds["area"] = (("lat", "lon"), eartharea(lon, lat).astype("float32"))
 
-    # Track desired fill values for encoding (default -999 everywhere)
-    var_fill_values: dict[str, float] = {v: DEFAULT_FILL_VALUE for v in ds.data_vars}
-    
-    # 1) Variable attributes from csv
-    for v in list(ds.variables):
-        if v == "time":
-            continue  # leave time attrs to xarray/CF
-        if v in meta.index:
-            row = meta.loc[v]
-            ln = row.get("long_name", None)
-            un = row.get("units", None)
-            if isinstance(ln, str) and ln:
-                ds[v].attrs["long_name"] = ln
-            if isinstance(un, str) and un:
-                ds[v].attrs["units"] = un
-    
-    # 2) Global attributes
+    # Global attributes
     ds.attrs.update({
         "title": "NGFS hourly gridded FRP metrics",
         "author": "Gonzalo A. Ferrada (gonzalo.ferrada@noaa.gov)",
@@ -383,56 +435,7 @@ def write_hour_grid_nc(df_hour, out_dir, R, bounding_box, sat_label=""):
         # "Conventions": "CF-1.8",
     })
     
-    # 3) Cast integer variables in the Dataset (from CSV type), define a FillValue for NaNs to avoid SerializationWarning
-    for v in ds.data_vars:
-        if v not in meta.index:
-            continue
-        t = str(meta.loc[v, "type"]).strip()
-        if t.startswith("int"):  # e.g., int16, int32
-            fill = int(var_fill_values.get(v, DEFAULT_FILL_VALUE))
-            ds[v] = ds[v].fillna(fill).astype(t)
-            var_fill_values[v] = fill
-    
-    # 4) Encoding from CSV types
-    enc: dict[str, dict] = {}
-
-    for v in ds.data_vars.keys() | ds.coords.keys():
-        if v == "time":
-            continue  # keep datetime64 handling default
-
-        # default dtype from CSV or float32
-        dtype = "float32"
-        if v in meta.index:
-            t = str(meta.loc[v, "type"]).strip()
-            if t:
-                dtype = t
-
-        var = ds[v]
-
-        if var.ndim == 3:      # (time, lat, lon)
-            enc[v] = dict(
-                zlib=True,
-                complevel=7,
-                dtype=dtype,
-                chunksizes=(1, 512, 512),
-            )
-        elif var.ndim == 2:    # (lat, lon)
-            enc[v] = dict(
-                zlib=True,
-                complevel=7,
-                dtype=dtype,
-                chunksizes=(512, 512),
-            )
-        elif var.ndim == 1:    # (lat) or (lon)
-            enc[v] = dict(dtype=dtype)
-        else:
-            enc[v] = dict(dtype=dtype)
-
-        # add FillValue for data variables
-        if v in var_fill_values:
-            enc[v]["_FillValue"] = var_fill_values[v]
-
-    ds.to_netcdf(fn, format="NETCDF4", encoding=enc)
+    write_ngfs_netcdf(ds, fn)
     return fn
 
 def _fire_presence_mask(ds: xr.Dataset):
@@ -499,49 +502,22 @@ def merge_hourly_satellite_grids(hour, east_nc, west_nc, out_dir, R):
                      xr.where(~mask_e & mask_w, False, prefer_pixels))
         prefer_e = prefer_e.where(combined_presence, False).fillna(False)
         combined_vars = {}
-        inherited_fill_values: dict[str, Any] = {}
-
-        def _resolve_fill_value(*arrays) -> float:
-            for arr in arrays:
-                if arr is None:
-                    continue
-                fill_val = arr.encoding.get("_FillValue")
-                if fill_val is None:
-                    fill_val = arr.attrs.get("_FillValue")
-                if fill_val is not None:
-                    return fill_val
-            return DEFAULT_FILL_VALUE
-
-        def _cast_fill_for_dtype(fill_val, dtype):
-            if np.issubdtype(dtype, np.integer):
-                return int(fill_val)
-            return float(fill_val)
-
         for var in sorted(set(ds_east.data_vars) | set(ds_west.data_vars)):
             if var == 'area':
                 continue
             arr_e = ds_east[var] if var in ds_east else None
             arr_w = ds_west[var] if var in ds_west else None
-            target = arr_e if arr_e is not None else arr_w
-            fill_val = _cast_fill_for_dtype(_resolve_fill_value(arr_e, arr_w), target.dtype)
             combined_vars[var] = _merge_variable(
                 prefer_e,
                 combined_presence,
                 arr_e,
                 arr_w,
-                fill_value=fill_val,
+                fill_value=DEFAULT_FILL_VALUE,
             )
-            inherited_fill_values[var] = fill_val
         if 'area' in ds_east:
             combined_vars['area'] = ds_east['area']
-            inherited_fill_values['area'] = _cast_fill_for_dtype(
-                _resolve_fill_value(ds_east['area']), ds_east['area'].dtype
-            )
         elif 'area' in ds_west:
             combined_vars['area'] = ds_west['area']
-            inherited_fill_values['area'] = _cast_fill_for_dtype(
-                _resolve_fill_value(ds_west['area']), ds_west['area'].dtype
-            )
         combined = xr.Dataset(combined_vars, coords=ds_east.coords)
 
         # Carry over variable metadata (attrs) from source satellite files
@@ -574,24 +550,7 @@ def merge_hourly_satellite_grids(hour, east_nc, west_nc, out_dir, R):
             "Values pulled from satellite with smaller pixel_area_mean; "
             "data_source flag indicates origin (1=east, 2=west)."
         )
-        enc = {}
-        for var, da in combined.data_vars.items():
-            if da.ndim == 3:
-                chunks = (1, 512, 512)
-            elif da.ndim == 2:
-                chunks = (512, 512)
-            else:
-                chunks = None
-            enc[var] = dict(zlib=True, complevel=7, dtype=str(da.dtype))
-            if chunks:
-                enc[var]['chunksizes'] = chunks
-            if var in inherited_fill_values:
-                enc[var]['_FillValue'] = inherited_fill_values[var]
-        enc.update({
-            'lat': {'dtype': 'float32'},
-            'lon': {'dtype': 'float32'}
-        })
-        combined.to_netcdf(combined_path, format='NETCDF4', encoding=enc)
+        write_ngfs_netcdf(combined, combined_path)
     return combined_path
     
 # ======================================================================
