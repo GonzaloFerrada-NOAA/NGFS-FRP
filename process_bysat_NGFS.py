@@ -17,7 +17,7 @@ def checkDir(path_check):
 def checkFile(file_in):
     # Check if a file exists. Exit with error if not found.
     if not os.path.isfile(file_in):
-        print(f"❌ Error: File not found: {file_in}")
+        print(f" Error: File not found: {file_in}")
         sys.exit(1)   # exit with error code
 
 def msg(text):
@@ -193,19 +193,21 @@ def hourly_regrid_metrics(df, bounding_box, R):
     """
     df = df.copy()
     df['acq_date_time'] = pd.to_datetime(df['acq_date_time'], utc=True, errors='coerce')
-
+    
+    # GAF this is wrong and makes no sense. Changing it to the left edge, so that
+    # fires detected bewteen 2 and 3 pm are labeled as 2 pm, not 3 pm. This makes more
+    # sense to the model since at the 2 pm integration it reads the averaged 
+    # FRP/emissions for that hour. 
     # define hour key as the RIGHT edge of the window (HH)
-    df['hour'] = df['acq_date_time'].dt.floor('h') + pd.Timedelta(hours=1)
+    # df['hour'] = df['acq_date_time'].dt.floor('h') + pd.Timedelta(hours=1)
+    # define hour key as the LOWER edge of the window (HH)
+    df['hour'] = df['acq_date_time'].dt.floor('h')
 
     # snap to grid (updates df['longitude'], df['latitude'] in place + rounding)
     snap2grid(df, bounding_box, R, xcol='longitude', ycol='latitude')
     
     # now add grid cell area
     add_grid_cell_area(df, R, lat_col='latitude', area_col='grid_area_km2')
-    
-    # FRP density:
-    # df["frp"] = df["frp"] / df["grid_area_km2"]
-    # df["frp"] = df["frp"] * df["grid_area_km2"]
     
     keys = ['hour', 'latitude', 'longitude']
 
@@ -308,9 +310,13 @@ def write_hour_grid_nc(df_hour, out_dir, R, bounding_box, sat_label=""):
     fn = Path(out_dir) / f'NGFS_{ymdh}Z_{Rout}{suffix}.nc'
 
     lon, lat = lonlat_axes(bounding_box, R)
-    fields = [c for c in ['frp_total','frp_mean','frp_std','frp_max',
-                          'pixel_area_total','pixel_area_mean','nobs']
-              if c in df_hour.columns]
+    fields = [c for c in [
+            'frp_total', 'frp_mean', 'frp_std', 'frp_max',
+            'pixel_area_total', 'pixel_area_mean', 'nobs',
+            'frp_density',
+            'confidence', 'quality_flag', 'type', 'known_incident_type'
+         ]
+         if c in df_hour.columns]
     grids = rasterize_hour_2d(df_hour, lon, lat, R, fields)
 
     ds = xr.Dataset(
@@ -338,6 +344,10 @@ def write_hour_grid_nc(df_hour, out_dir, R, bounding_box, sat_label=""):
         "pixel_area_mean":  {"long_name": "Mean detected pixel area", "units": "km2"},
         "nobs":             {"long_name": "Number of detections in grid cell", "units": "1"},
         "area":             {"long_name": "Grid cell area", "units": "km2"},
+        "confidence":        {"long_name": "NGFS confidence flag (min value within nobs)", "units": "1"},
+        "quality_flag":      {"long_name": "NGFS quality flag (1 or min within nobs)",   "units": "1"},
+        "type":              {"long_name": "NGFS detection type flag (1 or min within nobs)", "units": "1"},
+        "known_incident_type": {"long_name": "NGFS known incident type (mode within nobs)", "units": "1"},
     }
 
     for v, a in var_attrs.items():
@@ -362,7 +372,7 @@ def write_hour_grid_nc(df_hour, out_dir, R, bounding_box, sat_label=""):
     
     
     # NetCDF4 + deflate level 7 + chunking
-    msg(f"Saving {fn}")
+    # msg(f"Saving {fn}")
     enc = {f: dict(zlib=True, complevel=7, chunksizes=(1, 512, 512), dtype='float32') for f in grids}
     # enc = {f: dict(zlib=True, complevel=7, dtype='float32') for f in grids}
     # enc.update({'lat': {'dtype':'float32'}, 'lon': {'dtype':'float32'}})
@@ -421,7 +431,7 @@ def merge_hourly_satellite_grids(hour, east_nc, west_nc, out_dir, R):
     hour = pd.to_datetime(hour)
     ymdh = hour.strftime('%Y%m%d_%H')
     Rout = f"{R}".replace('.', 'p')
-    combined_path = Path(out_dir) / f'NGFS_{ymdh}Z_{Rout}_ew.nc'
+    combined_path = Path(out_dir) / f'NGFS_{ymdh}Z_{Rout}.nc'
     msg(f"Merging GOES east/west grids for {ymdh}Z")
     with xr.open_dataset(east_nc) as ds_east, xr.open_dataset(west_nc) as ds_west:
         if 'pixel_area_mean' not in ds_east or 'pixel_area_mean' not in ds_west:
@@ -492,8 +502,8 @@ def merge_hourly_satellite_grids(hour, east_nc, west_nc, out_dir, R):
     
 # ======================================================================
 # User defined:
-DATE1 = '2025-09-06'
-DATE2 = '2025-09-10'
+DATE1 = '2025-08-14'
+DATE2 = '2025-08-14'
 dates = pd.date_range(start=DATE1, end=DATE2, freq='D')
 
 # Save options:
@@ -599,13 +609,16 @@ for d in dates:
                 .astype(int)                  # make sure column is integer
             )
             
+            # Remove type == 3 and 4:
+            df.drop(df[df['type'].isin([3, 4])].index, inplace=True)
+            
             # Regrid and aggregate by hour:
             df_hourly = hourly_regrid_metrics(df, bounding_box, R)
             
             # Save
             if save_csv:
                 file_out = f"{path_csv}/ngfs_gridded_{R}_{sdate}_{sat_label}.csv"
-                msg(f"Saving {file_out}")
+                # msg(f"Saving {file_out}")
                 df_hourly.to_csv(file_out, index=False);
             
             if save_netcdf:
