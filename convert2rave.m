@@ -1,11 +1,11 @@
 clear;close;clc
 
-DATE1 = datetime([2025 09 01 21 00 00]);
-DATE2 = datetime([2025 09 10 23 00 00]);
+DATE1 = datetime([2025 08 15 00 00 00]);
+DATE2 = datetime([2025 09 11 23 00 00]);
 
 PATHIN = '/gpfs/f6/drsa-fire3/scratch/Gonzalo.Ferrada/FIRE/NGFS/gridded/netcdf';
 PATHRAVE = '/gpfs/f6/drsa-fire3/world-shared/Gonzalo.Ferrada/input/rave/raw';
-PATHOUT = '/gpfs/f6/drsa-fire3/scratch/Gonzalo.Ferrada/FIRE/NGFS/gridded/ravelike';
+PATHOUT = '/gpfs/f6/drsa-fire3/scratch/Gonzalo.Ferrada/FIRE/NGFS/gridded/asrave'; mkdir(PATHOUT);
 
 dates = DATE1 : hours(1) : DATE2;
 
@@ -23,6 +23,7 @@ for i = 1:numel(dates)
     f   = findfile([PATHRAVE '/RAVE-HrlyEmiss-3km_v2r0_blend_s' tag '00000_e*.nc']);
     fout= [PATHOUT '/RAVE-HrlyEmiss-3km_v2r0_blend_s' tag '00000.nc'];
     
+    % If RAVE file not found for current hour, try to find previous hours (up to 3h before):
     if ~isfile(f)
         f = findfile([PATHRAVE '/RAVE-HrlyEmiss-3km_v2r0_blend_s' char(dates(i) - hours(1), 'yyyyMMddHH') '00000_e*.nc']);
         if ~isfile(f)
