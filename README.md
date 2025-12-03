@@ -1,6 +1,6 @@
 # NGFS-FRP processing tool
 
-# Packages needed:
+## Packages needed:
 
 ```conda install -c conda-forge pandas xarray numpy netcdf4 dask```
 
@@ -16,7 +16,7 @@ Main tool that reads NGFS inputs in CSV format and grids them into a target grid
 (Temporary tool) Produces emissions of PM2.5 to be used as input to the cheMPAS-Fire model. It scales the emissions based on RAVE inputs (needed for processing). Note that for this tool to work properly, the NGFS data needs to be at a resolution of 0.03 degrees. An analogous tool in MATLAB is included.
 
 ## Sample data
-### data/
+#### data/
 NGFS input files from both GOES-18 and -19 for 2025-08-14.
-### gridded/
+#### gridded/
 Outputs in csv and netcdf formats from the main tool.
