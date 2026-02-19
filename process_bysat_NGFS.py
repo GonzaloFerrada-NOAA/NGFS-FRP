@@ -24,6 +24,49 @@ def checkFile(file_in):
 def msg(text):
     timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     print(f"{timestamp}    {text}")
+
+def normalize_hour_utc_naive(hour_like):
+    """Normalize hour-like value to timezone-naive UTC Timestamp."""
+    hour = pd.Timestamp(hour_like)
+    if hour.tzinfo is not None:
+        hour = hour.tz_convert('UTC').tz_localize(None)
+    return hour
+
+def get_version_tag() -> str:
+    return str(globals().get("cove_version", code_version))
+
+def build_output_paths(out_dir, hour_like, R, sat_label=""):
+    """
+    Centralized output path builder for all NGFS NetCDF products.
+    Update naming rules here only.
+    """
+    hour = normalize_hour_utc_naive(hour_like)
+    ymdh = hour.strftime('%Y%m%d%H%M%S')
+    Rout = f"{R}".replace('.', 'p')
+    suffix = f"_{sat_label.strip()}" if sat_label.strip() else ""
+    version_dir = Path(out_dir) / get_version_tag()
+    checkDir(version_dir)
+    return {
+        "version_dir": version_dir,
+        "hour": hour,
+        "ymdh": ymdh,
+        "resolution": Rout,
+        "suffix": suffix,
+        # "grid": version_dir / f'NGFS_{code_version}_{ymdh}Z_{Rout}{suffix}.nc',
+        # "point": version_dir / f'NGFS_{code_version}_pt_{ymdh}Z_{Rout}{suffix}.nc',
+        # "grid2d": version_dir / f'NGFS_{code_version}_{ymdh}Z_{Rout}{suffix}_2d.nc',
+        "grid": version_dir / f'NGFS_{code_version}_{Rout}_{ymdh}{suffix}.nc',
+        "point": version_dir / f'NGFS_{code_version}_{Rout}_pt_{ymdh}{suffix}.nc',
+        "grid2d": version_dir / f'NGFS_{code_version}_{Rout}_2d_{ymdh}{suffix}.nc',
+    }
+
+def remove_file_if_exists(path_like):
+    if path_like is None:
+        return
+    p = Path(path_like)
+    if p.is_file():
+        p.unlink()
+        msg(f"Removed intermediate file: {p}")
     
 def add_grid_cell_area(
     df,
@@ -220,6 +263,7 @@ def hourly_regrid_metrics(df, bounding_box, R):
     # metrics + flags (same rules you asked for)
     named_aggs = {
         'frp_total':        ('frp', 'sum'),
+        'frp_mean':         ('frp', 'mean'),
         'frp_std':          ('frp', lambda s: s.astype(float).std(ddof=0)),
         'frp_max':          ('frp', 'max'),
         'pixel_area_total': ('pixel_area', 'sum'),
@@ -244,14 +288,23 @@ def hourly_regrid_metrics(df, bounding_box, R):
         frp_total = out["frp_total"].astype(float).to_numpy()
         grid_area = out["grid_area_km2"].astype(float).to_numpy()
 
-        out["frp_mean"]    = np.where(denom > 0, (frp_total / denom) * grid_area, 0.0)
+        # out["frp_mean"]    = np.where(denom > 0, (frp_total / denom) * grid_area, 0.0) # v0.1, v0.2
+        out["frp_mean"]    = out["frp_mean"] # v0.3
         out["frp_density"] = np.where(denom > 0, frp_total / denom, 0.0)
+        out["fre"]         = out["frp_mean"] * 3600.0       # integrated over one hour (3600 s)
         
     return out  # one row per (hour, lat, lon) with metrics and nobs
 
 DEFAULT_FILL_VALUE = -999.0
 _META_TABLE: pd.DataFrame | None = None
-
+CORE_COORDS = {"lat", "lon", "time"}
+OUTPUT_ALIASES = {
+    "area": "GRID_AREA",
+    "confidence": "FLAG_CONFIDENCE",
+    "quality_flag": "FLAG_QUALITY",
+    "type": "FLAG_TYPE",
+    "known_incident_type": "FLAG_KNOWN_INCIDENT",
+}
 
 def get_meta_table() -> pd.DataFrame:
     global _META_TABLE
@@ -260,6 +313,62 @@ def get_meta_table() -> pd.DataFrame:
         _META_TABLE = pd.read_csv(meta_path).set_index("varname")
     return _META_TABLE
 
+def _build_meta_name_lookup(meta: pd.DataFrame) -> dict[str, str]:
+    lookup: dict[str, str] = {}
+    for name in meta.index.astype(str):
+        lookup[name.lower()] = name
+    return lookup
+
+def output_var_name(var_name: str, meta: pd.DataFrame | None = None) -> str:
+    """Convert internal variable names to output NetCDF variable names."""
+    if var_name in CORE_COORDS:
+        return var_name
+    if meta is None:
+        meta = get_meta_table()
+    meta_lookup = _build_meta_name_lookup(meta)
+    if var_name in meta.index:
+        return var_name
+    if var_name in OUTPUT_ALIASES:
+        alias = OUTPUT_ALIASES[var_name]
+        return alias if alias in meta.index else alias
+    if var_name.upper() in meta.index:
+        return var_name.upper()
+    return meta_lookup.get(var_name.lower(), var_name.upper())
+
+def _resolve_ds_var_name(ds: xr.Dataset, logical_name: str, meta: pd.DataFrame | None = None) -> str | None:
+    """Find the actual dataset variable for a logical internal name."""
+    if meta is None:
+        meta = get_meta_table()
+    candidates = [logical_name, output_var_name(logical_name, meta), logical_name.upper()]
+    if logical_name in OUTPUT_ALIASES:
+        alias = OUTPUT_ALIASES[logical_name]
+        candidates.extend([alias, alias.lower()])
+    for cand in candidates:
+        if cand in ds:
+            return cand
+    return None
+
+def rename_ds_for_output(ds: xr.Dataset, meta: pd.DataFrame | None = None) -> xr.Dataset:
+    """Rename data variables to output names while preserving lat/lon/time."""
+    if meta is None:
+        meta = get_meta_table()
+    rename_map: dict[str, str] = {}
+    drop_vars: list[str] = []
+    reserved_targets = set(ds.data_vars) | set(ds.coords)
+    for var in ds.data_vars:
+        target = output_var_name(var, meta)
+        if target != var:
+            # Avoid xarray rename collisions when an aliased target already exists.
+            if target in reserved_targets:
+                drop_vars.append(var)
+            else:
+                rename_map[var] = target
+                reserved_targets.add(target)
+    if drop_vars:
+        ds = ds.drop_vars(drop_vars)
+    if not rename_map:
+        return ds
+    return ds.rename(rename_map)
 
 def lonlat_axes(bounding_box, R):
     lon_min, lon_max, lat_min, lat_max = bounding_box
@@ -278,6 +387,200 @@ def rasterize_hour_2d(df_hour, lon, lat, R, fields):
     for f in fields:
         grids[f][i_lat, i_lon] = df_hour[f].to_numpy(dtype='float32')
     return grids
+
+def point_dataset_from_hour_df(df_hour, R, bounding_box, description):
+    if df_hour.empty:
+        raise ValueError("Cannot build point dataset from empty hourly dataframe.")
+
+    hour = normalize_hour_utc_naive(df_hour['hour'].iloc[0])
+    fields = [c for c in [
+            'frp_total', 'frp_mean', 'frp_std', 'frp_max',
+            'pixel_area_total', 'pixel_area_mean', 'nobs',
+            'frp_density', 'fre',
+            'confidence', 'quality_flag', 'type', 'known_incident_type'
+         ]
+         if c in df_hour.columns]
+
+    point_count = len(df_hour)
+    coords: dict[str, Any] = {
+        "point": np.arange(point_count, dtype="int32"),
+        "lat": ("point", df_hour["latitude"].to_numpy(dtype="float32")),
+        "lon": ("point", df_hour["longitude"].to_numpy(dtype="float32")),
+        "time": ("point", np.repeat(np.datetime64(hour), point_count)),
+    }
+    data_vars: dict[str, Any] = {
+        f: (("point",), df_hour[f].to_numpy()) for f in fields
+    }
+    if "grid_area_km2" in df_hour.columns:
+        data_vars["area"] = (("point",), df_hour["grid_area_km2"].to_numpy(dtype="float32"))
+
+    ds = xr.Dataset(
+        data_vars=data_vars,
+        coords=coords,
+        attrs={
+            "grid_spacing_deg": float(R),
+            "bounding_box": np.array(bounding_box, dtype='float32'),
+            "description": description,
+            "layout": "point",
+        },
+    )
+    return ds
+
+def point_dataset_to_grid_dataset(ds_points, R, bounding_box):
+    lon, lat = lonlat_axes(bounding_box, R)
+    point_lon = np.asarray(ds_points["lon"].to_numpy(), dtype=float)
+    point_lat = np.asarray(ds_points["lat"].to_numpy(), dtype=float)
+    point_time = ds_points["time"].to_numpy()
+    if point_time.size == 0:
+        raise ValueError("Point dataset has no time values.")
+    hour = np.datetime64(pd.Timestamp(point_time[0]))
+
+    start_lon, start_lat = float(lon[0]), float(lat[0])
+    i_lon = np.clip(np.rint((point_lon - start_lon) / R).astype(int), 0, len(lon) - 1)
+    i_lat = np.clip(np.rint((point_lat - start_lat) / R).astype(int), 0, len(lat) - 1)
+
+    ny, nx = len(lat), len(lon)
+    data_vars: dict[str, Any] = {}
+    area_var_name = output_var_name("area")
+    for var in ds_points.data_vars:
+        if var == area_var_name:
+            continue
+        arr = ds_points[var]
+        if "point" not in arr.dims:
+            continue
+        grid = np.full((ny, nx), DEFAULT_FILL_VALUE, dtype='float32')
+        grid[i_lat, i_lon] = np.asarray(arr.to_numpy(), dtype='float32')
+        data_vars[var] = (("time", "lat", "lon"), grid[None, ...])
+
+    ds_grid = xr.Dataset(
+        data_vars=data_vars,
+        coords={
+            "time": [hour],
+            "lat": lat,
+            "lon": lon,
+        },
+        attrs=dict(ds_points.attrs),
+    )
+    ds_grid.attrs["layout"] = "grid"
+    ds_grid[area_var_name] = (("lat", "lon"), eartharea(lon, lat).astype("float32"))
+    return ds_grid
+
+def load_static_emissions_lookup(static_file_path, R):
+    static_path = Path(static_file_path)
+    if not static_path.is_file():
+        raise FileNotFoundError(f"Static emissions file not found: {static_path}")
+
+    with xr.open_dataset(static_path) as ds_s:
+        s_lats = np.asarray(ds_s["lat"].to_numpy(), dtype=np.float32)
+        s_lons = np.asarray(ds_s["lon"].to_numpy(), dtype=np.float32)
+        ef_std = np.asarray(ds_s["EFACTOR_PM25"].to_numpy(), dtype=np.float32).ravel()
+        ef_flam = np.asarray(ds_s["EFACTOR_FLAMING_PM25"].to_numpy(), dtype=np.float32).ravel()
+        beta_vfei = np.asarray(ds_s["BETA_VFEI"].to_numpy(), dtype=np.float32).ravel()
+        lcf_raw = np.asarray(ds_s["land_cover_fraction"].to_numpy())
+
+        # Normalize land_cover_fraction to shape (nclass, nlat*nlon).
+        # Expected class count is 17; support any axis ordering containing (17, nlat, nlon).
+        if lcf_raw.ndim != 3:
+            raise ValueError("land_cover_fraction must be 3-D in static file.")
+        lcf_shape = lcf_raw.shape
+        if 17 not in lcf_shape:
+            raise ValueError("land_cover_fraction must include a class dimension of size 17.")
+        class_axis = int(np.where(np.array(lcf_shape) == 17)[0][0])
+        lcf_moved = np.moveaxis(lcf_raw, class_axis, 0)  # -> (17, *, *)
+        if lcf_moved.shape[1] != s_lats.size or lcf_moved.shape[2] != s_lons.size:
+            raise ValueError(
+                "land_cover_fraction spatial dimensions do not match lat/lon dimensions in static file."
+            )
+        lcf_flat = lcf_moved.reshape(17, -1)
+
+    return {
+        "R": float(R),
+        "lat_min": float(np.min(s_lats)),
+        "lat_max": float(np.max(s_lats)),
+        "lon_min": float(np.min(s_lons)),
+        "nlat": int(s_lats.size),
+        "nlon": int(s_lons.size),
+        "is_top_down": bool(s_lats[0] > s_lats[-1]),
+        "ef_std_flat": ef_std,
+        "ef_flam_flat": ef_flam,
+        "beta_vfei_flat": beta_vfei,
+        "land_cover_fraction_flat": lcf_flat,
+    }
+
+def append_pm25_emissions_to_points(ds_points, static_lookup, beta_val=0.38, debug=False):
+    fre_name = _resolve_ds_var_name(ds_points, "fre")
+    incident_name = _resolve_ds_var_name(ds_points, "known_incident_type")
+    if fre_name is None or incident_name is None:
+        raise ValueError("Merged dataset must contain FRE and FLAG_KNOWN_INCIDENT variables for emissions.")
+
+    p_lat = np.asarray(ds_points["lat"].to_numpy(), dtype=np.float32)
+    p_lon = np.asarray(ds_points["lon"].to_numpy(), dtype=np.float32)
+    fre = np.asarray(ds_points[fre_name].to_numpy(), dtype=np.float32)
+    incident_flag = np.asarray(ds_points[incident_name].to_numpy())
+
+    R_static = float(static_lookup["R"])
+    if static_lookup["is_top_down"]:
+        lat_idx = np.rint((static_lookup["lat_max"] - p_lat) / R_static).astype(np.int64)
+    else:
+        lat_idx = np.rint((p_lat - static_lookup["lat_min"]) / R_static).astype(np.int64)
+    lon_idx = np.rint((p_lon - static_lookup["lon_min"]) / R_static).astype(np.int64)
+
+    lat_idx = np.clip(lat_idx, 0, static_lookup["nlat"] - 1)
+    lon_idx = np.clip(lon_idx, 0, static_lookup["nlon"] - 1)
+    flat_idx = lat_idx * static_lookup["nlon"] + lon_idx
+
+    ef_std = np.take(static_lookup["ef_std_flat"], flat_idx)
+    ef_flam = np.take(static_lookup["ef_flam_flat"], flat_idx)
+    beta_vfei = np.take(static_lookup["beta_vfei_flat"], flat_idx)
+    ef_to_use = np.where(incident_flag == 2, ef_flam, ef_std)
+
+    emis_pm25 = fre * float(beta_val) * ef_to_use * 1e-3
+    emis_pm25_vfei = fre * beta_vfei * ef_to_use * 1e-3
+    invalid = (~np.isfinite(fre)) | (fre == float(DEFAULT_FILL_VALUE))
+    emis_pm25 = np.where(invalid, float(DEFAULT_FILL_VALUE), emis_pm25).astype(np.float32, copy=False)
+    emis_pm25_vfei = np.where(invalid, float(DEFAULT_FILL_VALUE), emis_pm25_vfei).astype(np.float32, copy=False)
+
+    out = ds_points.copy()
+    out["EMIS_PM25"] = (("point",), emis_pm25)
+    out["EMIS_PM25"].attrs.update({
+        "units": "kg",
+        "long_name": f"PM2.5 emissions calculated from NGFS FRE (Beta={beta_val})",
+        "coordinates": "lat lon time",
+    })
+    out["EMIS_PM25_VFEI"] = (("point",), emis_pm25_vfei)
+    out["EMIS_PM25_VFEI"].attrs.update({
+        "units": "kg",
+        "long_name": "PM2.5 emissions calculated from NGFS FRE using BETA_VFEI",
+        "coordinates": "lat lon time",
+    })
+    if debug:
+        out["EFACTOR_PM25"] = (("point",), ef_std.astype(np.float32, copy=False))
+        out["EFACTOR_PM25"].attrs.update({
+            "units": "g MJ-1",
+            "long_name": "Lookup EFACTOR_PM25 used for PM2.5 emissions diagnostics",
+            "coordinates": "lat lon time",
+        })
+        out["EFACTOR_FLAMING_PM25"] = (("point",), ef_flam.astype(np.float32, copy=False))
+        out["EFACTOR_FLAMING_PM25"].attrs.update({
+            "units": "g MJ-1",
+            "long_name": "Lookup EFACTOR_FLAMING_PM25 used for PM2.5 emissions diagnostics",
+            "coordinates": "lat lon time",
+        })
+        out["EFACTOR_PM25_USED"] = (("point",), ef_to_use.astype(np.float32, copy=False))
+        out["EFACTOR_PM25_USED"].attrs.update({
+            "units": "g MJ-1",
+            "long_name": "Emission factor selected by incident flag (flaming if flag==2, else standard)",
+            "coordinates": "lat lon time",
+        })
+        if "land_cover_fraction_flat" in static_lookup:
+            lcf = np.take(static_lookup["land_cover_fraction_flat"], flat_idx, axis=1)
+            out = out.assign_coords(lc_class=np.arange(lcf.shape[0], dtype=np.int16))
+            out["LAND_COVER_FRACTION"] = (("lc_class", "point"), lcf.astype(np.float32, copy=False))
+            out["LAND_COVER_FRACTION"].attrs.update({
+                "long_name": "Static land cover fraction profile used for diagnostics",
+                "coordinates": "lat lon time",
+            })
+    return out
 
 def eartharea(lon, lat):
     lon = np.asarray(lon)
@@ -310,14 +613,20 @@ def eartharea(lon, lat):
     
     return garea
 
-
 def write_ngfs_netcdf(ds: xr.Dataset, out_path: Path | str, meta: pd.DataFrame | None = None):
     """
     Apply NGFS variable metadata, enforce dtypes/fill values, and write NetCDF.
     """
     if meta is None:
         meta = get_meta_table()
-    ds = ds.copy()
+    ds = rename_ds_for_output(ds.copy(), meta)
+    # Rebuild dataset so NetCDF variable declaration keeps all data variables
+    # grouped before coordinate variables (stable, predictable order).
+    ds = xr.Dataset(
+        data_vars={name: ds[name] for name in ds.data_vars},
+        coords={name: ds.coords[name] for name in ds.coords},
+        attrs=dict(ds.attrs),
+    )
     var_fill_values: dict[str, float] = {}
 
     # Coordinate attributes/dtypes (skip time to preserve CF handling)
@@ -361,9 +670,11 @@ def write_ngfs_netcdf(ds: xr.Dataset, out_path: Path | str, meta: pd.DataFrame |
     enc: dict[str, dict[str, Any]] = {}
     for var, da in ds.data_vars.items():
         if da.ndim == 3:
-            chunks = (1, 512, 512)
+            base_chunks = (1, 512, 512)
+            chunks = tuple(min(int(dim_len), int(base)) for dim_len, base in zip(da.shape, base_chunks))
         elif da.ndim == 2:
-            chunks = (512, 512)
+            base_chunks = (512, 512)
+            chunks = tuple(min(int(dim_len), int(base)) for dim_len, base in zip(da.shape, base_chunks))
         else:
             chunks = None
         entry: dict[str, Any] = dict(zlib=True, complevel=7, dtype=str(da.dtype))
@@ -383,50 +694,94 @@ def write_ngfs_netcdf(ds: xr.Dataset, out_path: Path | str, meta: pd.DataFrame |
     ds.to_netcdf(out_path, format="NETCDF4", encoding=enc)
     return out_path
 
-def write_hour_grid_nc(df_hour, out_dir, R, bounding_box, sat_label=""):
+def write_ngfs_point_netcdf(
+    ds_grid: xr.Dataset,
+    out_path: Path | str,
+    meta: pd.DataFrame | None = None,
+    fill_value: float = DEFAULT_FILL_VALUE,
+):
+    """
+    Write compact 1-D point NetCDF from a gridded dataset.
+    Keeps only active/valid cells to reduce file size.
+    """
+    if meta is None:
+        meta = get_meta_table()
+    ds = rename_ds_for_output(ds_grid.copy(), meta)
+
+    # Stack regular grid into one point dimension.
+    if {"time", "lat", "lon"}.issubset(ds.coords):
+        stacked = ds.stack(point=("time", "lat", "lon"))
+        point_time = stacked.indexes["point"].get_level_values("time").to_numpy()
+        point_lat = stacked.indexes["point"].get_level_values("lat").to_numpy(dtype="float32")
+        point_lon = stacked.indexes["point"].get_level_values("lon").to_numpy(dtype="float32")
+    elif {"lat", "lon"}.issubset(ds.coords):
+        stacked = ds.stack(point=("lat", "lon"))
+        point_time = None
+        point_lat = stacked.indexes["point"].get_level_values("lat").to_numpy(dtype="float32")
+        point_lon = stacked.indexes["point"].get_level_values("lon").to_numpy(dtype="float32")
+    else:
+        raise ValueError("Point conversion expects coordinates including lat/lon.")
+
+    # Keep only active fires (prefer FRE, fallback to FRP_MEAN).
+    fre_var = _resolve_ds_var_name(stacked, "fre", meta)
+    frp_var = _resolve_ds_var_name(stacked, "frp_mean", meta)
+    if fre_var is not None:
+        active = stacked[fre_var] > 0
+    elif frp_var is not None:
+        active = stacked[frp_var] > 0
+    else:
+        active = xr.ones_like(next(iter(stacked.data_vars.values())), dtype=bool)
+
+    valid = active.fillna(False)
+    for var_name, da in stacked.data_vars.items():
+        if "point" not in da.dims:
+            continue
+        if np.issubdtype(da.dtype, np.floating):
+            valid = valid & da.notnull() & np.isfinite(da) & (da != float(fill_value))
+        elif np.issubdtype(da.dtype, np.integer):
+            valid = valid & (da != int(fill_value))
+
+    keep_idx = np.flatnonzero(valid.to_numpy())
+
+    coords = {
+        "point": np.arange(len(keep_idx), dtype="int32"),
+        "lat": ("point", point_lat[keep_idx]),
+        "lon": ("point", point_lon[keep_idx]),
+    }
+    if point_time is not None:
+        coords["time"] = ("point", point_time[keep_idx])
+
+    out_vars = {}
+    for var_name, da in stacked.data_vars.items():
+        if "point" in da.dims:
+            out_vars[var_name] = (("point",), da.to_numpy()[keep_idx])
+
+    ds_points = xr.Dataset(out_vars, coords=coords, attrs=ds.attrs)
+    ds_points.attrs["layout"] = "point"
+    ds_points.attrs["point_filter"] = "active fires only (FRP_MEAN or FRE > 0), excluding fill/NaN values"
+
+    out_path = Path(out_path)
+    write_ngfs_netcdf(ds_points, out_path, meta=meta)
+    return out_path
+
+def write_hour_products_nc(df_hour, out_dir, R, bounding_box, sat_label=""):
     if df_hour.empty:
         return None
-    
-    hour = df_hour['hour'].iloc[0]
-    
-    # ensure timezone-naive UTC before converting to numpy datetime64
-    if hasattr(hour, 'tzinfo') and hour.tzinfo is not None:
-        hour = hour.tz_convert('UTC').tz_localize(None)
-        
-    ymdh = hour.strftime('%Y%m%d_%H')
-    Rout = f"{R}".replace('.', 'p')
-    suffix = f"_{sat_label.strip()}" if sat_label.strip() else ""
-    fn = Path(out_dir) / f'NGFS_{ymdh}Z_{Rout}{suffix}.nc'
-    
-    lon, lat = lonlat_axes(bounding_box, R)
-    fields = [c for c in [
-            'frp_total', 'frp_mean', 'frp_std', 'frp_max',
-            'pixel_area_total', 'pixel_area_mean', 'nobs',
-            'frp_density',
-            'confidence', 'quality_flag', 'type', 'known_incident_type'
-         ]
-         if c in df_hour.columns]
-    
-    grids = rasterize_hour_2d(df_hour, lon, lat, R, fields)
 
-    # Build dataset:
-    ds = xr.Dataset(
-        {f: (('time','lat','lon'), grids[f][None, ...]) for f in grids},
-        coords={'time': [np.datetime64(hour)], 
-                'lat': lat, 
-                'lon': lon
-                },
-        attrs={'grid_spacing_deg': float(R),
-               'bounding_box': np.array(bounding_box, dtype='float32'),
-               'description': 'Hourly metrics on regular lat/lon grid'}
+    paths = build_output_paths(out_dir, df_hour['hour'].iloc[0], R, sat_label=sat_label)
+    fn_primary = paths["grid"]
+    fn_points = paths["point"]
+
+    ds_points = point_dataset_from_hour_df(
+        df_hour=df_hour,
+        R=R,
+        bounding_box=bounding_box,
+        description="Hourly metrics as point-source detections",
     )
-    
-    # 2-D grid area:
-    ds["area"] = (("lat", "lon"), eartharea(lon, lat).astype("float32"))
 
     # Global attributes
-    ds.attrs.update({
-        "title": "NGFS hourly gridded FRP metrics",
+    ds_points.attrs.update({
+        "title": "NGFS hourly point-source FRP metrics",
         "author": "Gonzalo A. Ferrada (gonzalo.ferrada@noaa.gov)",
         "institution": "CIRES/CU Boulder, GSL/NOAA",
         "source": "NGFS point detections (https://cimss.ssec.wisc.edu/ngfs/)",
@@ -435,16 +790,23 @@ def write_hour_grid_nc(df_hour, out_dir, R, bounding_box, sat_label=""):
         # "Conventions": "CF-1.8",
     })
     
-    write_ngfs_netcdf(ds, fn)
-    return fn
+    write_ngfs_netcdf(ds_points, fn_primary)
+    if save_netcdf_points:
+        write_ngfs_netcdf(ds_points, fn_points)
+    return {
+        "grid": fn_primary,
+        "point": fn_points if save_netcdf_points else None,
+        "grid2d": None,
+    }
 
 def _fire_presence_mask(ds: xr.Dataset):
     """Return boolean mask where any core fire metric is > 0."""
-    candidate_vars = ['nobs', 'pixel_area_total', 'frp_total', 'pixel_area_mean', 'frp_mean']
+    candidate_vars = ['nobs', 'pixel_area_total', 'frp_total', 'pixel_area_mean', 'frp_mean', 'fre']
     mask = None
     for name in candidate_vars:
-        if name in ds:
-            da = ds[name]
+        ds_name = _resolve_ds_var_name(ds, name)
+        if ds_name is not None:
+            da = ds[ds_name]
             candidate = da > 0
             mask = candidate if mask is None else (mask | candidate)
     if mask is None:
@@ -478,80 +840,136 @@ def _merge_variable(prefer_east, presence_mask, arr_east, arr_west, fill_value=D
         merged = merged.astype(target.dtype)
     return merged
 
-def merge_hourly_satellite_grids(hour, east_nc, west_nc, out_dir, R):
-    hour = pd.to_datetime(hour)
-    ymdh = hour.strftime('%Y%m%d_%H')
-    Rout = f"{R}".replace('.', 'p')
-    combined_path = Path(out_dir) / f'NGFS_{ymdh}Z_{Rout}.nc'
+def _point_ds_to_dataframe(ds: xr.Dataset) -> pd.DataFrame:
+    df = ds.to_dataframe().reset_index()
+    if "point" in df.columns:
+        df = df.drop(columns=["point"])
+    key_cols = ["time", "lat", "lon"]
+    for col in key_cols:
+        if col not in df.columns:
+            raise ValueError(f"Point dataset missing '{col}' coordinate.")
+    df["time"] = pd.to_datetime(df["time"], errors="coerce")
+    df = df.dropna(subset=key_cols)
+    df = df.sort_values(key_cols, kind="mergesort").reset_index(drop=True)
+    return df
+
+def _merge_hourly_point_dataframes(df_e: pd.DataFrame, df_w: pd.DataFrame, pix_var_e: str, pix_var_w: str) -> pd.DataFrame:
+    key_cols = ["time", "lat", "lon"]
+    vars_e = [c for c in df_e.columns if c not in key_cols]
+    vars_w = [c for c in df_w.columns if c not in key_cols]
+    df_e_ren = df_e.rename(columns={c: f"{c}_e" for c in vars_e})
+    df_w_ren = df_w.rename(columns={c: f"{c}_w" for c in vars_w})
+    merged = df_e_ren.merge(df_w_ren, on=key_cols, how="outer", indicator=True)
+
+    pix_e_col = f"{pix_var_e}_e"
+    pix_w_col = f"{pix_var_w}_w"
+    if pix_e_col not in merged.columns or pix_w_col not in merged.columns:
+        raise ValueError("Both point datasets must contain pixel area mean variable for merge.")
+
+    both = merged["_merge"] == "both"
+    left_only = merged["_merge"] == "left_only"
+    right_only = merged["_merge"] == "right_only"
+    pix_e = merged[pix_e_col].where(merged[pix_e_col] > 0)
+    pix_w = merged[pix_w_col].where(merged[pix_w_col] > 0)
+    prefer_pixels = np.where(
+        pix_e.notna() & pix_w.notna(),
+        pix_e <= pix_w,
+        np.where(pix_e.notna(), True, np.where(pix_w.notna(), False, True)),
+    )
+    prefer_e = np.where(left_only, True, np.where(right_only, False, prefer_pixels))
+    prefer_e = np.where(both | left_only | right_only, prefer_e, False)
+
+    out = merged[key_cols].copy()
+    union_vars = sorted(set(vars_e) | set(vars_w))
+    for var in union_vars:
+        e_col = f"{var}_e"
+        w_col = f"{var}_w"
+        if e_col in merged.columns and w_col in merged.columns:
+            out[var] = np.where(prefer_e, merged[e_col], merged[w_col])
+        elif e_col in merged.columns:
+            out[var] = merged[e_col]
+        elif w_col in merged.columns:
+            out[var] = merged[w_col]
+
+    out["flag_data_source"] = np.where(prefer_e, 1, 2).astype("int16")
+    out = out.sort_values(key_cols, kind="mergesort").reset_index(drop=True)
+    return out
+
+def _point_dataframe_to_dataset(df: pd.DataFrame, attrs: dict[str, Any] | None = None) -> xr.Dataset:
+    key_cols = ["time", "lat", "lon"]
+    vars_out = [c for c in df.columns if c not in key_cols]
+    coords: dict[str, Any] = {
+        "point": np.arange(len(df), dtype="int32"),
+        "lat": ("point", df["lat"].to_numpy(dtype="float32")),
+        "lon": ("point", df["lon"].to_numpy(dtype="float32")),
+        "time": ("point", pd.to_datetime(df["time"], errors="coerce").to_numpy()),
+    }
+    data_vars = {var: (("point",), df[var].to_numpy()) for var in vars_out}
+    ds = xr.Dataset(data_vars=data_vars, coords=coords, attrs=(attrs or {}))
+    ds.attrs["layout"] = "point"
+    return ds
+
+def merge_hourly_satellite_grids(
+    hour,
+    east_nc,
+    west_nc,
+    out_dir,
+    R,
+    bounding_box,
+    estimate_emissions=False,
+    emissions_lookup=None,
+    emissions_beta=0.38,
+    emissions_debug=False,
+):
+    paths = build_output_paths(out_dir, hour, R, sat_label="")
+    ymdh = paths["ymdh"]
+    combined_path = paths["grid"]
+    combined_point_path = paths["point"]
+    combined_grid2d_path = paths["grid2d"]
     msg(f"Merging GOES east/west grids for {ymdh}Z")
     with xr.open_dataset(east_nc) as ds_east, xr.open_dataset(west_nc) as ds_west:
-        if 'pixel_area_mean' not in ds_east or 'pixel_area_mean' not in ds_west:
-            raise ValueError("Both satellite NetCDFs must contain 'pixel_area_mean'")
-        ds_east, ds_west = xr.align(ds_east, ds_west, join='outer')
-        mask_e = _fire_presence_mask(ds_east)
-        mask_w = _fire_presence_mask(ds_west)
-        combined_presence = (mask_e | mask_w)
-        pix_e = ds_east['pixel_area_mean'].where(ds_east['pixel_area_mean'] > 0)
-        pix_w = ds_west['pixel_area_mean'].where(ds_west['pixel_area_mean'] > 0)
-        prefer_pixels = xr.where(
-            pix_e.notnull() & pix_w.notnull(),
-            pix_e <= pix_w,
-            xr.where(pix_e.notnull(), True, xr.where(pix_w.notnull(), False, False))
+        pix_var_e = _resolve_ds_var_name(ds_east, 'pixel_area_mean')
+        pix_var_w = _resolve_ds_var_name(ds_west, 'pixel_area_mean')
+        if pix_var_e is None or pix_var_w is None:
+            raise ValueError("Both satellite NetCDFs must contain pixel area mean variable")
+        df_e = _point_ds_to_dataframe(ds_east)
+        df_w = _point_ds_to_dataframe(ds_west)
+        merged_df = _merge_hourly_point_dataframes(df_e, df_w, pix_var_e, pix_var_w)
+        merged_attrs = dict(ds_west.attrs)
+        merged_attrs['description'] = (
+            ds_west.attrs.get('description', 'NGFS hourly metrics') +
+            ' (east/west merged by minimum pixel area mean)'
         )
-        prefer_e = xr.where(mask_e & ~mask_w, True,
-                     xr.where(~mask_e & mask_w, False, prefer_pixels))
-        prefer_e = prefer_e.where(combined_presence, False).fillna(False)
-        combined_vars = {}
-        for var in sorted(set(ds_east.data_vars) | set(ds_west.data_vars)):
-            if var == 'area':
-                continue
-            arr_e = ds_east[var] if var in ds_east else None
-            arr_w = ds_west[var] if var in ds_west else None
-            combined_vars[var] = _merge_variable(
-                prefer_e,
-                combined_presence,
-                arr_e,
-                arr_w,
-                fill_value=DEFAULT_FILL_VALUE,
-            )
-        if 'area' in ds_east:
-            combined_vars['area'] = ds_east['area']
-        elif 'area' in ds_west:
-            combined_vars['area'] = ds_west['area']
-        combined = xr.Dataset(combined_vars, coords=ds_east.coords)
-
-        # Carry over variable metadata (attrs) from source satellite files
-        def _inherit_var_metadata(var_name: str):
-            for src in (ds_east, ds_west):
-                if var_name in src:
-                    combined[var_name].attrs.update(src[var_name].attrs)
-                    return
-
-        for var_name in combined_vars.keys():
-            _inherit_var_metadata(var_name)
-
-        origin_flag = xr.zeros_like(prefer_e, dtype='int16')
-        origin_flag = xr.where(mask_e & ~mask_w, 1, origin_flag)
-        origin_flag = xr.where(~mask_e & mask_w, 2, origin_flag)
-        origin_flag = xr.where(mask_e & mask_w, xr.where(prefer_e, 1, 2), origin_flag)
-        origin_flag = origin_flag.where(combined_presence, 0)
-        combined['data_source'] = origin_flag
-        combined['data_source'].attrs.update({
-            "long_name": "Source satellite for gridded cell (1=east, 2=west)",
+        merged_attrs['merge_note'] = (
+            "Values pulled from satellite with smaller pixel area mean; "
+            "flag_data_source indicates origin (1=east, 2=west)."
+        )
+        combined = _point_dataframe_to_dataset(merged_df, attrs=merged_attrs)
+        combined['flag_data_source'].attrs.update({
+            "long_name": "Source satellite for point (1=east, 2=west)",
             "flag_values": [1, 2],
             "flag_meanings": "east west",
         })
-        combined.attrs.update(ds_west.attrs)
-        combined.attrs['description'] = (
-            ds_west.attrs.get('description', 'NGFS hourly metrics') +
-            ' (east/west merged by minimum pixel_area_mean)'
-        )
-        combined.attrs['merge_note'] = (
-            "Values pulled from satellite with smaller pixel_area_mean; "
-            "data_source flag indicates origin (1=east, 2=west)."
-        )
+        if estimate_emissions:
+            if emissions_lookup is None:
+                raise ValueError("estimate_emissions=True requires loaded emissions_lookup.")
+            combined = append_pm25_emissions_to_points(
+                combined,
+                static_lookup=emissions_lookup,
+                beta_val=emissions_beta,
+                debug=emissions_debug,
+            )
         write_ngfs_netcdf(combined, combined_path)
-    return combined_path
+        if save_netcdf_points:
+            write_ngfs_netcdf(combined, combined_point_path)
+        if save_netcdf_2d:
+            combined_grid = point_dataset_to_grid_dataset(combined, R, bounding_box)
+            write_ngfs_netcdf(combined_grid, combined_grid2d_path)
+    return {
+        "grid": combined_path,
+        "point": combined_point_path if save_netcdf_points else None,
+        "grid2d": combined_grid2d_path if save_netcdf_2d else None,
+    }
     
 # ======================================================================
 # User defined:
@@ -560,24 +978,45 @@ DATE2 = '2025-09-11'
 dates = pd.date_range(start=DATE1, end=DATE2, freq='D')
 
 # Save options:
-save_netcdf = True
-save_csv    = True
+save_netcdf         = True
+save_netcdf_points  = False
+save_netcdf_2d      = False
+save_csv            = False
+remove_intermediate = True
+
+estimate_emissions  = True
+emissions_beta      = 0.38
+emissions_static_file = None
+emissions_debug     = False
 
 # Paths:
 path_main   = "/gpfs/f6/drsa-fire3/scratch/Gonzalo.Ferrada/FIRE/NGFS"
 path_in     = path_main + "/data"
 path_png    = path_main + "/png"
-path_csv    = path_main + "/gridded/csv"
-path_netcdf = path_main + "/gridded/netcdf"
+path_csv    = path_main + "/output/csv"
+path_netcdf = path_main + "/output/netcdf"
 
 # End user definitions
 # No further modifications needed beyond this point
 # ======================================================================
+code_version = "v0.31"
+if "cove_version" not in globals():
+    cove_version = code_version
 # output grid:
-# bounding_box    = np.array([-170.0, -50.0, 15.0, 75.0])
-bounding_box    = np.array([-138.0, -57.0, 20.0, 54.0])
+# Do not change bounding box, since this is the same used later when 
+# generating emissions so we keep the same dimensions and lat/lons as
+# the pre processed land use maps (IGBP)
+bounding_box    = np.array([-135.0, -50.0, 15.0, 55.0])
 # R               = 0.01 # Resolution in degrees
 R               = 0.03
+
+if emissions_static_file is None:
+    emissions_static_file = f"{path_main}/static/NGFS_EF_A2024.061.CONUS.r{R}.nc"
+
+emissions_lookup = None
+if estimate_emissions:
+    msg(f"Loading static emissions lookup: {emissions_static_file}")
+    emissions_lookup = load_static_emissions_lookup(emissions_static_file, R)
 
 # Create output directories:
 checkDir(path_csv)
@@ -672,23 +1111,34 @@ for d in dates:
             
             if save_netcdf:
                 for hour, df_h in df_hourly.groupby('hour', sort=True):
-                    nc_path = write_hour_grid_nc(df_h, path_netcdf, R, bounding_box, sat_label=sat_label)
-                    if nc_path:
-                        hour_key = pd.Timestamp(hour)
-                        if hour_key.tzinfo is not None:
-                            hour_key = hour_key.tz_convert('UTC').tz_localize(None)
-                        sat_hour_files[sat_label][hour_key] = nc_path
+                    nc_paths = write_hour_products_nc(df_h, path_netcdf, R, bounding_box, sat_label=sat_label)
+                    if nc_paths:
+                        hour_key = normalize_hour_utc_naive(hour)
+                        sat_hour_files[sat_label][hour_key] = nc_paths
         
         if save_netcdf:
             shared_hours = sorted(set(sat_hour_files.get('w', {})) & set(sat_hour_files.get('e', {})))
             for hour_key in shared_hours:
                 merge_hourly_satellite_grids(
                     hour_key,
-                    sat_hour_files['e'][hour_key],
-                    sat_hour_files['w'][hour_key],
+                    sat_hour_files['e'][hour_key]["grid"],
+                    sat_hour_files['w'][hour_key]["grid"],
                     path_netcdf,
-                    R
+                    R,
+                    bounding_box,
+                    estimate_emissions=estimate_emissions,
+                    emissions_lookup=emissions_lookup,
+                    emissions_beta=emissions_beta,
+                    emissions_debug=emissions_debug,
                 )
+                if remove_intermediate:
+                    for sat_label in ("e", "w"):
+                        sat_paths = sat_hour_files.get(sat_label, {}).get(hour_key)
+                        if not sat_paths:
+                            continue
+                        remove_file_if_exists(sat_paths.get("grid"))
+                        remove_file_if_exists(sat_paths.get("point"))
+                        remove_file_if_exists(sat_paths.get("grid2d"))
             
         
         

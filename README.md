@@ -20,3 +20,20 @@ Main tool that reads NGFS inputs in CSV format and grids them into a target grid
 NGFS input files from both GOES-18 and -19 for 2025-08-14.
 #### gridded/
 Outputs in csv and netcdf formats from the main tool.
+
+
+# Change log
+#### v0.31 (12 Feb 2026)
+Improved processing speed. Now default product is always 1-D, i.e., as "point-source" instead of 2-D arrays, since when processing at R=0.01 degrees the code became too slow for real-time applications. Added the option save_netcdf_2d in case the user wants to save the final merged product in 2-D (not recommended)
+
+#### v0.3 (11 Feb 2026)
+Fixed a bug when calculating FRP_MEAN. Now NGFS FRP is much more comparable to RAVE, especially at higher latitudes.
+
+#### v0.2 (9 Feb 2026)
+Overhauled the output product: variable names, attributes. Added FRE to the list of output variables.
+
+#### v0.1 (December 2025)
+Fixed a bug when calculating FRP density.
+
+#### v0 (September 2025)
+First version of the code

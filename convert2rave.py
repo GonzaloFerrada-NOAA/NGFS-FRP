@@ -9,8 +9,8 @@ from scipy.spatial import cKDTree
 from datetime import timedelta
 
 # --- Configuration ---
-DATE1 = "2025-08-15 00:00:00"
-DATE2 = "2025-08-15 23:00:00"
+DATE1 = "2025-08-16 00:00:00"
+DATE2 = "2025-09-10 23:00:00"
 
 PATHIN = '/gpfs/f6/drsa-fire3/scratch/Gonzalo.Ferrada/FIRE/NGFS/gridded/netcdf'
 PATHRAVE = '/gpfs/f6/drsa-fire3/world-shared/Gonzalo.Ferrada/input/rave/raw'
@@ -88,18 +88,20 @@ for dt in dates:
         r_lon = ds['grid_lont'].values - 360
         r_lat = ds['grid_latt'].values
         r_frp = ds['FRP_MEAN'].values
+        r_fre = ds['FRE'].values
         
         # Create mask based on original logic
         mask_rave = (
             (r_lon >= -138) & (r_lon <= -57) & 
             (r_lat >= 20) & (r_lat <= 54) & 
-            (r_frp > 0)
+            (r_fre > 0)
         )
         
         rave_subset = {}
-        rave_subset['lon'] = r_lon[mask_rave] + 360
-        rave_subset['lat'] = r_lat[mask_rave]
+        rave_subset['lon']      = r_lon[mask_rave] + 360
+        rave_subset['lat']      = r_lat[mask_rave]
         rave_subset['FRP_MEAN'] = r_frp[mask_rave]
+        rave_subset['FRE']      = r_fre[mask_rave]
         
         for s in SPECIES_CALC:
             rave_subset[s] = ds[s].values[mask_rave]
@@ -119,8 +121,9 @@ for dt in dates:
         # Calculate ratios and apply
         for s in SPECIES_CALC:
             # factor = rave_species / rave_frp_mean (at closest index)
-            factor = rave_subset[s][idx_phys] / rave_subset['FRP_MEAN'][idx_phys]
-            ngfs_data[s] = ngfs_data['frp_mean'] * factor
+            # factor = rave_subset[s][idx_phys] / rave_subset['FRP_MEAN'][idx_phys]
+            factor = rave_subset[s][idx_phys] / rave_subset['FRE'][idx_phys]
+            ngfs_data[s] = ngfs_data['frp_mean'] * 3600 * factor # x3600 to use FRE
     else:
         # Fallback if no valid RAVE fires found in box
         for s in SPECIES_CALC:
