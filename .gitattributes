@@ -1,0 +1,2 @@
+static/NGFS_STATIC_A2024.061.CONUS.r0.01.nc filter=lfs diff=lfs merge=lfs -text
+static/NGFS_STATIC_A2024.061.CONUS.r0.03.nc filter=lfs diff=lfs merge=lfs -text
