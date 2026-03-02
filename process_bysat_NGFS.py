@@ -242,7 +242,7 @@ def hourly_regrid_metrics(df, bounding_box, R):
     # define hour key as the RIGHT edge of the window (HH)
     # df['hour'] = df['acq_date_time'].dt.floor('h') + pd.Timedelta(hours=1)
     # define hour key as the LOWER edge of the window (HH)
-    df['hour'] = df['acq_date_time'].dt.floor('h')
+    df['hour'] = df['acq_date_time'].dt.floor('h').dt.tz_localize(None)
 
     # snap to grid (updates df['longitude'], df['latitude'] in place + rounding)
     snap2grid(df, bounding_box, R, xcol='longitude', ycol='latitude')
@@ -1028,11 +1028,6 @@ if estimate_emissions:
 # Create output directories:
 checkDir(path_netcdf)
 
-# Set date/doy variables based on target_hour (single execution)
-d = target_hour
-sdate   = d.strftime("%Y_%m_%d")    # "YYYY_MM_DD"
-sdoy    = d.strftime("%j")          # "JJJ"
-
 # construct full file path of ngfs:
 file_w = sys.argv[2]
 file_e = sys.argv[3]
@@ -1070,6 +1065,16 @@ try:
             "pixel_area", "confidence", "quality_flag", "type",
             "known_incident_type"
         ]]
+
+        # Parse timestamps once, keep only the requested hour before regridding.
+        df["acq_date_time"] = pd.to_datetime(df["acq_date_time"], utc=True, errors="coerce")
+        df.dropna(subset=["acq_date_time"], inplace=True)
+        target_hour_utc = pd.Timestamp(target_hour, tz="UTC")
+        next_hour_utc = target_hour_utc + pd.Timedelta(hours=1)
+        df = df[(df["acq_date_time"] >= target_hour_utc) & (df["acq_date_time"] < next_hour_utc)]
+        if df.empty:
+            msg(f"No detections found for {sat_name} during target hour {target_hour}.")
+            continue
         
         # Filter for bounding box
         df = df[(df['longitude'] > bounding_box[0]) & (df['longitude'] < bounding_box[1])]
