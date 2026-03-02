@@ -52,9 +52,6 @@ def build_output_paths(out_dir, hour_like, R, sat_label=""):
         "ymdh": ymdh,
         "resolution": Rout,
         "suffix": suffix,
-        # "grid": version_dir / f'NGFS_{code_version}_{ymdh}Z_{Rout}{suffix}.nc',
-        # "point": version_dir / f'NGFS_{code_version}_pt_{ymdh}Z_{Rout}{suffix}.nc',
-        # "grid2d": version_dir / f'NGFS_{code_version}_{ymdh}Z_{Rout}{suffix}_2d.nc',
         "grid": version_dir / f'NGFS_{code_version}_{Rout}_{ymdh}{suffix}.nc',
         "point": version_dir / f'NGFS_{code_version}_{Rout}_pt_{ymdh}{suffix}.nc',
         "grid2d": version_dir / f'NGFS_{code_version}_{Rout}_2d_{ymdh}{suffix}.nc',
@@ -973,28 +970,38 @@ def merge_hourly_satellite_grids(
     
 # ======================================================================
 # User defined:
-DATE1 = '2025-08-14'
-DATE2 = '2025-09-11'
-dates = pd.date_range(start=DATE1, end=DATE2, freq='D')
+# PARSE ARGUMENTS FOR REAL TIME PROCESSING
+if len(sys.argv) < 4:
+    print("Usage: python process_bysat_NGFS.py   YYYY-MM-DD_HH:MM:SS   path/to/file_goes_west.csv   path/to/file_goes_east.csv")
+    sys.exit(1)
+
+arg_timestamp = sys.argv[1]
+try:
+    # Parse format: 2026-02-25_18:00:00
+    current_time = datetime.strptime(arg_timestamp, "%Y-%m-%d_%H:%M:%S")
+    # Ensure consistency (naive UTC as used in the script)
+    target_hour = normalize_hour_utc_naive(current_time).replace(minute=0, second=0, microsecond=0)
+except ValueError:
+    print("Error: Timestamp must be in format YYYY-MM-DD_HH:MM:SS")
+    sys.exit(1)
+
+msg(f"Processing single hour: {target_hour}")
 
 # Save options:
-save_netcdf         = True
-save_netcdf_points  = False
-save_netcdf_2d      = False
-save_csv            = False
-remove_intermediate = True
+save_netcdf             = True
+save_netcdf_points      = False
+save_netcdf_2d          = False
+remove_intermediate     = True
 
-estimate_emissions  = True
-emissions_beta      = 0.38
-emissions_static_file = None
-emissions_debug     = False
+estimate_emissions      = True
+emissions_beta          = 0.38
+emissions_static_file   = None
+emissions_debug         = False
 
 # Paths:
 path_main   = "/gpfs/f6/drsa-fire3/scratch/Gonzalo.Ferrada/FIRE/NGFS"
-path_in     = path_main + "/data"
-path_png    = path_main + "/png"
-path_csv    = path_main + "/output/csv"
-path_netcdf = path_main + "/output/netcdf"
+path_netcdf = path_main + "/output"
+# path_netcdf = sys.argv[4]
 
 # End user definitions
 # No further modifications needed beyond this point
@@ -1011,7 +1018,7 @@ bounding_box    = np.array([-135.0, -50.0, 15.0, 55.0])
 R               = 0.03
 
 if emissions_static_file is None:
-    emissions_static_file = f"{path_main}/static/NGFS_EF_A2024.061.CONUS.r{R}.nc"
+    emissions_static_file = f"{path_main}/static/NGFS_STATIC_A2024.061.CONUS.r{R}.nc"
 
 emissions_lookup = None
 if estimate_emissions:
@@ -1019,136 +1026,132 @@ if estimate_emissions:
     emissions_lookup = load_static_emissions_lookup(emissions_static_file, R)
 
 # Create output directories:
-checkDir(path_csv)
 checkDir(path_netcdf)
 
-# Loop through dates
-for d in dates:
-    
-    sdate   = d.strftime("%Y_%m_%d")    # "YYYY_MM_DD"
-    sdoy    = d.strftime("%j")          # "JJJ"
+# Set date/doy variables based on target_hour (single execution)
+d = target_hour
+sdate   = d.strftime("%Y_%m_%d")    # "YYYY_MM_DD"
+sdoy    = d.strftime("%j")          # "JJJ"
 
-    # construct full file path of ngfs:
-    file_w = f"{path_in}/NGFS_FIRE_DETECTIONS_GOES-18_ABI_CONUS_{sdate}_{sdoy}.csv"
-    file_e = f"{path_in}/NGFS_FIRE_DETECTIONS_GOES-19_ABI_CONUS_{sdate}_{sdoy}.csv"
-    checkFile(file_w)
-    checkFile(file_e)
+# construct full file path of ngfs:
+file_w = sys.argv[2]
+file_e = sys.argv[3]
+checkFile(file_w)
+checkFile(file_e)
     
-    sat_hour_files = {'w': {}, 'e': {}}
-    try:
-        # Read the wildfire data from the CSV file
-        msg(f"Reading data from {file_w}")
-        dfw = pd.read_csv(file_w)
+sat_hour_files = {'w': {}, 'e': {}}
+try:
+    # Read the wildfire data from the CSV file
+    msg(f"Reading data from {file_w}")
+    dfw = pd.read_csv(file_w)
+    
+    msg(f"Reading data from {file_e}")
+    dfe = pd.read_csv(file_e)
+    
+    sat_datasets = [
+        ('w', dfw, 'GOES-18'),
+        ('e', dfe, 'GOES-19'),
+    ]
+    for sat_label, df_raw, sat_name in sat_datasets:
+        msg(f"Processing {sat_name} detections ({sat_label})")
+        df = df_raw.copy()
         
-        msg(f"Reading data from {file_e}")
-        dfe = pd.read_csv(file_e)
+        # Define columns for pixel center point and the four corners
+        cols_to_check = ['latitude', 'longitude', 'frp']
         
-        sat_datasets = [
-            ('w', dfw, 'GOES-18'),
-            ('e', dfe, 'GOES-19'),
-        ]
-        for sat_label, df_raw, sat_name in sat_datasets:
-            msg(f"Processing {sat_name} detections ({sat_label})")
-            df = df_raw.copy()
-            
-            # Define columns for pixel center point and the four corners
-            cols_to_check = ['latitude', 'longitude', 'frp']
-            
-            # Remove rows with missing values
-            for col in cols_to_check:
-                df[col] = pd.to_numeric(df[col], errors='coerce')
-            df.dropna(subset=cols_to_check, inplace=True)
-            
-            # Keep only columns we use:
-            df = df[[
-                "acq_date_time", "latitude", "longitude", "frp",
-                "pixel_area", "confidence", "quality_flag", "type",
-                "known_incident_type"
-            ]]
-            
-            # Filter for bounding box
-            df = df[(df['longitude'] > bounding_box[0]) & (df['longitude'] < bounding_box[1])]
-            df = df[(df['latitude'] > bounding_box[2]) & (df['latitude'] < bounding_box[3])]
-            
-            # Sort data by time, lat and lon
-            df.sort_values(
-                by=['acq_date_time', 'latitude', 'longitude'],
-                ascending=[True, True, True],
-                inplace=True
-            )
-            
-            # Replace values in known_incident_type
-            mapping = {"WF": 1, "RX": 2}
-            df['known_incident_type'] = (
-                df['known_incident_type']
-                .replace("", np.nan)          # treat empty string as NaN
-                .map(mapping)                 # map WF->1, RX->2
-                .fillna(-999)                 # replace NaN with -999
-                .astype(int)                  # make sure column is integer
-            )
-            
-            # Replace confidence values
-            mapping = {"low": 0, "nominal": 1, "high": 2}
-            df['confidence'] = (
-                df['confidence']
-                .replace("", np.nan)          # treat empty string as NaN
-                .map(mapping)                 # map WF->1, RX->2
-                .fillna(-999)                 # replace NaN with -999
-                .astype(int)                  # make sure column is integer
-            )
-            
-            # Remove type == 3 and 4:
-            df.drop(df[df['type'].isin([3, 4])].index, inplace=True)
-            
-            # Regrid and aggregate by hour:
-            df_hourly = hourly_regrid_metrics(df, bounding_box, R)
-            
-            # Save
-            if save_csv:
-                file_out = f"{path_csv}/ngfs_gridded_{R}_{sdate}_{sat_label}.csv"
-                # msg(f"Saving {file_out}")
-                df_hourly.to_csv(file_out, index=False);
-            
-            if save_netcdf:
-                for hour, df_h in df_hourly.groupby('hour', sort=True):
-                    nc_paths = write_hour_products_nc(df_h, path_netcdf, R, bounding_box, sat_label=sat_label)
-                    if nc_paths:
-                        hour_key = normalize_hour_utc_naive(hour)
-                        sat_hour_files[sat_label][hour_key] = nc_paths
+        # Remove rows with missing values
+        for col in cols_to_check:
+            df[col] = pd.to_numeric(df[col], errors='coerce')
+        df.dropna(subset=cols_to_check, inplace=True)
         
-        if save_netcdf:
-            shared_hours = sorted(set(sat_hour_files.get('w', {})) & set(sat_hour_files.get('e', {})))
-            for hour_key in shared_hours:
-                merge_hourly_satellite_grids(
-                    hour_key,
-                    sat_hour_files['e'][hour_key]["grid"],
-                    sat_hour_files['w'][hour_key]["grid"],
-                    path_netcdf,
-                    R,
-                    bounding_box,
-                    estimate_emissions=estimate_emissions,
-                    emissions_lookup=emissions_lookup,
-                    emissions_beta=emissions_beta,
-                    emissions_debug=emissions_debug,
-                )
-                if remove_intermediate:
-                    for sat_label in ("e", "w"):
-                        sat_paths = sat_hour_files.get(sat_label, {}).get(hour_key)
-                        if not sat_paths:
-                            continue
-                        remove_file_if_exists(sat_paths.get("grid"))
-                        remove_file_if_exists(sat_paths.get("point"))
-                        remove_file_if_exists(sat_paths.get("grid2d"))
-            
+        # Keep only columns we use:
+        df = df[[
+            "acq_date_time", "latitude", "longitude", "frp",
+            "pixel_area", "confidence", "quality_flag", "type",
+            "known_incident_type"
+        ]]
         
+        # Filter for bounding box
+        df = df[(df['longitude'] > bounding_box[0]) & (df['longitude'] < bounding_box[1])]
+        df = df[(df['latitude'] > bounding_box[2]) & (df['latitude'] < bounding_box[3])]
         
+        # Sort data by time, lat and lon
+        df.sort_values(
+            by=['acq_date_time', 'latitude', 'longitude'],
+            ascending=[True, True, True],
+            inplace=True
+        )
+        
+        # Replace values in known_incident_type
+        mapping = {"WF": 1, "RX": 2}
+        df['known_incident_type'] = (
+            df['known_incident_type']
+            .replace("", np.nan)          # treat empty string as NaN
+            .map(mapping)                 # map WF->1, RX->2
+            .fillna(-999)                 # replace NaN with -999
+            .astype(int)                  # make sure column is integer
+        )
+        
+        # Replace confidence values
+        mapping = {"low": 0, "nominal": 1, "high": 2}
+        df['confidence'] = (
+            df['confidence']
+            .replace("", np.nan)          # treat empty string as NaN
+            .map(mapping)                 # map WF->1, RX->2
+            .fillna(-999)                 # replace NaN with -999
+            .astype(int)                  # make sure column is integer
+        )
+        
+        # Remove type == 3 and 4:
+        df.drop(df[df['type'].isin([3, 4])].index, inplace=True)
+        
+        # Regrid and aggregate by hour:
+        df_hourly = hourly_regrid_metrics(df, bounding_box, R)
+        
+        # --- FILTER FOR THE SPECIFIC TARGET HOUR ONLY ---
+        df_h = df_hourly[df_hourly['hour'] == target_hour]
 
-    except FileNotFoundError:
-        print(f"Error: The file(s) '{file_e}' and/or '{file_w}' was/were not found.")
-    except ImportError:
-        print("Error: This script requires pandas, matplotlib, and cartopy.")
-        print("Please install them using: pip install pandas matplotlib cartopy")
-    except Exception as e:
-        print(f"An error occurred: {e}")
+        # Save
+        if save_netcdf and not df_h.empty:
+            # Process strictly the target hour
+            nc_paths = write_hour_products_nc(df_h, path_netcdf, R, bounding_box, sat_label=sat_label)
+            if nc_paths:
+                sat_hour_files[sat_label][target_hour] = nc_paths
+    
+    if save_netcdf:
+        # Merge if both satellites have data for the target hour
+        if target_hour in sat_hour_files['e'] and target_hour in sat_hour_files['w']:
+            merge_hourly_satellite_grids(
+                target_hour,
+                sat_hour_files['e'][target_hour]["grid"],
+                sat_hour_files['w'][target_hour]["grid"],
+                path_netcdf,
+                R,
+                bounding_box,
+                estimate_emissions=estimate_emissions,
+                emissions_lookup=emissions_lookup,
+                emissions_beta=emissions_beta,
+                emissions_debug=emissions_debug,
+            )
+            if remove_intermediate:
+                for sat_label in ("e", "w"):
+                    sat_paths = sat_hour_files.get(sat_label, {}).get(target_hour)
+                    if not sat_paths:
+                        continue
+                    remove_file_if_exists(sat_paths.get("grid"))
+                    remove_file_if_exists(sat_paths.get("point"))
+                    remove_file_if_exists(sat_paths.get("grid2d"))
+        else:
+            msg(f"Skipping merge: detections for {target_hour} not available in both GOES-18 and GOES-19.")
         
+    
+
+except FileNotFoundError:
+    print(f"Error: The file(s) '{file_e}' and/or '{file_w}' was/were not found.")
+except ImportError:
+    print("Error: This script requires pandas, matplotlib, and cartopy.")
+    print("Please install them using: pip install pandas matplotlib cartopy")
+except Exception as e:
+    print(f"An error occurred: {e}")
+    
 msg("done!")
