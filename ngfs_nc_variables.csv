@@ -2,6 +2,8 @@
 lon,longitude,degrees_east,float32
 lat,latitude,degrees_north,float32
 time,time,-,int16
+lon_corners,pixel corner longitudes,degrees_east,float32
+lat_corners,pixel corner latitudes,degrees_north,float32
 FRP_TOTAL,Total FRP (SUM of all FRPs) in current grid cell,MW,float32
 FRP_MEAN,Mean FRP (FRP_TOTAL / NOBS) in current grid cell,MW,float32
 FRP_STD,Standard deviation of FRP detections in grid cell,MW,float32

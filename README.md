@@ -23,6 +23,13 @@ Outputs in csv and netcdf formats from the main tool.
 
 
 # Change log
+#### v0.4 (26 Mar 2026)
+- Modified how the script is called, to make it more flexible for real-time.
+`process_bysat_NGFS.py  YYYY-MM-DD_HH:MM:SS  integration_minutes  path/to/goes_west_dir  path/to/goes_east_dir`
+- Script automatically construct CSV file names and includes them for processing. Useful in case the user requests a time window that goes beyond midnight.
+- FRE is now calculated using the actual number of observations over the time window requested, rather than assuming 12 observations per hours (Before: FRE = FRP * 12 * 300; Now: FRE = FRP * Nobs * 300)
+- Includes two new variables `lat_corners` and `lon_corners` that contain the corner coordinates of the current GOES pixel. Useful for regridding.
+
 #### v0.31 (12 Feb 2026)
 Improved processing speed. Now default product is always 1-D, i.e., as "point-source" instead of 2-D arrays, since when processing at R=0.01 degrees the code became too slow for real-time applications. Added the option save_netcdf_2d in case the user wants to save the final merged product in 2-D (not recommended)
 

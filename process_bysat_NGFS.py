@@ -2,7 +2,6 @@
 # coding: utf-8
 import os
 import sys
-import glob
 import pandas as pd
 import xarray as xr
 import numpy as np
@@ -15,15 +14,14 @@ def checkDir(path_check):
     if not os.path.isdir(path_check):
         os.makedirs(path_check, exist_ok=True)
 
-def checkFile(file_in):
-    # Check if a file exists. Exit with error if not found.
-    if not os.path.isfile(file_in):
-        print(f" Error: File not found: {file_in}")
-        sys.exit(1)   # exit with error code
-
 def msg(text):
     timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     print(f"{timestamp}    {text}")
+
+def checkInputDir(path_in):
+    if not os.path.isdir(path_in):
+        print(f" Error: Input directory not found: {path_in}")
+        sys.exit(1)
 
 def normalize_hour_utc_naive(hour_like):
     """Normalize hour-like value to timezone-naive UTC Timestamp."""
@@ -32,29 +30,57 @@ def normalize_hour_utc_naive(hour_like):
         hour = hour.tz_convert('UTC').tz_localize(None)
     return hour
 
+def window_dates(start_time, end_time):
+    """Return all UTC dates touched by the half-open interval [start_time, end_time)."""
+    if end_time <= start_time:
+        return []
+    dates = []
+    d0 = start_time.date()
+    d1 = (end_time - timedelta(microseconds=1)).date()
+    current = d0
+    while current <= d1:
+        dates.append(current)
+        current += timedelta(days=1)
+    return dates
+
+def daily_ngfs_csv_path(data_dir, sat_platform, day_obj):
+    ymd = day_obj.strftime("%Y_%m_%d")
+    jjj = day_obj.strftime("%j")
+    filename = f"NGFS_FIRE_DETECTIONS_{sat_platform}_ABI_CONUS_{ymd}_{jjj}.csv"
+    return Path(data_dir) / filename
+
+CORNER_COUNT = 4
+LAT_CORNER_COLS = [f"latitude_c{i}" for i in range(1, CORNER_COUNT + 1)]
+LON_CORNER_COLS = [f"longitude_c{i}" for i in range(1, CORNER_COUNT + 1)]
+
 def get_version_tag() -> str:
     return str(globals().get("cove_version", code_version))
 
-def build_output_paths(out_dir, hour_like, R, sat_label=""):
+def build_output_paths(out_dir, start_like, R, sat_label="", integration_minutes=60):
     """
     Centralized output path builder for all NGFS NetCDF products.
     Update naming rules here only.
     """
-    hour = normalize_hour_utc_naive(hour_like)
-    ymdh = hour.strftime('%Y%m%d%H%M%S')
-    Rout = f"{R}".replace('.', 'p')
+    start_time = normalize_hour_utc_naive(start_like)
+    ymdh = start_time.strftime('%Y%m%d%H%M%S')
+    dt_minutes = int(integration_minutes)
+    if dt_minutes <= 0:
+        raise ValueError("integration_minutes must be > 0.")
+    period_tag = "hourly" if dt_minutes == 60 else f"{dt_minutes}-min"
+    file_tag = f"NGFS_{code_version}_{period_tag}"
     suffix = f"_{sat_label.strip()}" if sat_label.strip() else ""
     version_dir = Path(out_dir) / get_version_tag()
     checkDir(version_dir)
     return {
         "version_dir": version_dir,
-        "hour": hour,
+        "start_time": start_time,
         "ymdh": ymdh,
-        "resolution": Rout,
+        "integration_minutes": dt_minutes,
+        "period_tag": period_tag,
         "suffix": suffix,
-        "grid": version_dir / f'NGFS_{code_version}_{Rout}_{ymdh}{suffix}.nc',
-        "point": version_dir / f'NGFS_{code_version}_{Rout}_pt_{ymdh}{suffix}.nc',
-        "grid2d": version_dir / f'NGFS_{code_version}_{Rout}_2d_{ymdh}{suffix}.nc',
+        "grid": version_dir / f'{file_tag}_{ymdh}{suffix}.nc',
+        "point": version_dir / f'{file_tag}_pt_{ymdh}{suffix}.nc',
+        "grid2d": version_dir / f'{file_tag}_2d_{ymdh}{suffix}.nc',
     }
 
 def remove_file_if_exists(path_like):
@@ -167,6 +193,10 @@ def _mode_first(s: pd.Series):
     m = s.mode()
     return m.iloc[0] if len(m) else s.iloc[0]
 
+def _first_valid(s: pd.Series):
+    s = s.dropna()
+    return s.iloc[0] if not s.empty else np.nan
+
 def regrid_and_aggregate_metrics(
         df: pd.DataFrame,
         bounding_box,
@@ -271,6 +301,9 @@ def hourly_regrid_metrics(df, bounding_box, R):
         'type':             ('type', _prefer_one_zero_min),
         'known_incident_type': ('known_incident_type', _mode_first),
     }
+    for col in LAT_CORNER_COLS + LON_CORNER_COLS:
+        if col in df.columns:
+            named_aggs[col] = (col, _first_valid)
 
     agg_df = (df.groupby(keys, as_index=False)
                 .agg(**{k:v for k,v in named_aggs.items() if v[0] in df.columns}))
@@ -288,7 +321,8 @@ def hourly_regrid_metrics(df, bounding_box, R):
         # out["frp_mean"]    = np.where(denom > 0, (frp_total / denom) * grid_area, 0.0) # v0.1, v0.2
         out["frp_mean"]    = out["frp_mean"] # v0.3
         out["frp_density"] = np.where(denom > 0, frp_total / denom, 0.0)
-        out["fre"]         = out["frp_mean"] * 3600.0       # integrated over one hour (3600 s)
+        # FRE integration using nominal GOES cadence (5 min) times actual observation count.
+        out["fre"]         = out["frp_mean"] * (300.0 * out["nobs"].astype(float))
         
     return out  # one row per (hour, lat, lon) with metrics and nobs
 
@@ -301,6 +335,8 @@ OUTPUT_ALIASES = {
     "quality_flag": "FLAG_QUALITY",
     "type": "FLAG_TYPE",
     "known_incident_type": "FLAG_KNOWN_INCIDENT",
+    "lat_corners": "LAT_CORNERS",
+    "lon_corners": "LON_CORNERS",
 }
 
 def get_meta_table() -> pd.DataFrame:
@@ -387,9 +423,14 @@ def rasterize_hour_2d(df_hour, lon, lat, R, fields):
 
 def point_dataset_from_hour_df(df_hour, R, bounding_box, description):
     if df_hour.empty:
-        raise ValueError("Cannot build point dataset from empty hourly dataframe.")
+        raise ValueError("Cannot build point dataset from empty aggregated dataframe.")
 
-    hour = normalize_hour_utc_naive(df_hour['hour'].iloc[0])
+    if "hour" in df_hour.columns:
+        point_time = pd.to_datetime(df_hour["hour"], errors="coerce")
+    else:
+        fallback_time = normalize_hour_utc_naive(df_hour['acq_date_time'].iloc[0])
+        point_time = pd.Series(np.repeat(np.datetime64(fallback_time), len(df_hour)))
+
     fields = [c for c in [
             'frp_total', 'frp_mean', 'frp_std', 'frp_max',
             'pixel_area_total', 'pixel_area_mean', 'nobs',
@@ -403,13 +444,25 @@ def point_dataset_from_hour_df(df_hour, R, bounding_box, description):
         "point": np.arange(point_count, dtype="int32"),
         "lat": ("point", df_hour["latitude"].to_numpy(dtype="float32")),
         "lon": ("point", df_hour["longitude"].to_numpy(dtype="float32")),
-        "time": ("point", np.repeat(np.datetime64(hour), point_count)),
+        "time": ("point", point_time.to_numpy(dtype="datetime64[ns]")),
     }
     data_vars: dict[str, Any] = {
         f: (("point",), df_hour[f].to_numpy()) for f in fields
     }
     if "grid_area_km2" in df_hour.columns:
         data_vars["area"] = (("point",), df_hour["grid_area_km2"].to_numpy(dtype="float32"))
+    has_lat_corners = all(c in df_hour.columns for c in LAT_CORNER_COLS)
+    has_lon_corners = all(c in df_hour.columns for c in LON_CORNER_COLS)
+    if has_lat_corners and has_lon_corners:
+        coords["corner"] = np.arange(1, CORNER_COUNT + 1, dtype="int8")
+        data_vars["lat_corners"] = (
+            ("point", "corner"),
+            df_hour[LAT_CORNER_COLS].to_numpy(dtype="float32"),
+        )
+        data_vars["lon_corners"] = (
+            ("point", "corner"),
+            df_hour[LON_CORNER_COLS].to_numpy(dtype="float32"),
+        )
 
     ds = xr.Dataset(
         data_vars=data_vars,
@@ -438,6 +491,7 @@ def point_dataset_to_grid_dataset(ds_points, R, bounding_box):
 
     ny, nx = len(lat), len(lon)
     data_vars: dict[str, Any] = {}
+    corner_values = None
     area_var_name = output_var_name("area")
     for var in ds_points.data_vars:
         if var == area_var_name:
@@ -445,17 +499,34 @@ def point_dataset_to_grid_dataset(ds_points, R, bounding_box):
         arr = ds_points[var]
         if "point" not in arr.dims:
             continue
-        grid = np.full((ny, nx), DEFAULT_FILL_VALUE, dtype='float32')
-        grid[i_lat, i_lon] = np.asarray(arr.to_numpy(), dtype='float32')
-        data_vars[var] = (("time", "lat", "lon"), grid[None, ...])
+        if arr.ndim == 1:
+            grid = np.full((ny, nx), DEFAULT_FILL_VALUE, dtype='float32')
+            grid[i_lat, i_lon] = np.asarray(arr.to_numpy(), dtype='float32')
+            data_vars[var] = (("time", "lat", "lon"), grid[None, ...])
+            continue
+        if arr.ndim == 2 and "corner" in arr.dims:
+            vals = np.asarray(arr.transpose("point", "corner").to_numpy(), dtype='float32')
+            ncorner = vals.shape[1]
+            grid = np.full((ncorner, ny, nx), DEFAULT_FILL_VALUE, dtype='float32')
+            grid[:, i_lat, i_lon] = vals.T
+            data_vars[var] = (("time", "corner", "lat", "lon"), grid[None, ...])
+            if "corner" in ds_points.coords:
+                corner_values = ds_points["corner"].to_numpy()
+            elif corner_values is None:
+                corner_values = np.arange(1, ncorner + 1, dtype="int8")
+            continue
+        raise ValueError(f"Unsupported point variable shape for gridding: {var} dims={arr.dims}")
 
+    coords = {
+        "time": [hour],
+        "lat": lat,
+        "lon": lon,
+    }
+    if corner_values is not None:
+        coords["corner"] = corner_values
     ds_grid = xr.Dataset(
         data_vars=data_vars,
-        coords={
-            "time": [hour],
-            "lat": lat,
-            "lon": lon,
-        },
+        coords=coords,
         attrs=dict(ds_points.attrs),
     )
     ds_grid.attrs["layout"] = "grid"
@@ -761,29 +832,50 @@ def write_ngfs_point_netcdf(
     write_ngfs_netcdf(ds_points, out_path, meta=meta)
     return out_path
 
-def write_hour_products_nc(df_hour, out_dir, R, bounding_box, sat_label=""):
+def write_window_products_nc(
+    df_hour,
+    out_dir,
+    R,
+    bounding_box,
+    start_time,
+    valid_date_start,
+    valid_date_end,
+    integration_minutes=60,
+    sat_label="",
+):
     if df_hour.empty:
         return None
 
-    paths = build_output_paths(out_dir, df_hour['hour'].iloc[0], R, sat_label=sat_label)
+    paths = build_output_paths(
+        out_dir,
+        start_time,
+        R,
+        sat_label=sat_label,
+        integration_minutes=integration_minutes,
+    )
     fn_primary = paths["grid"]
     fn_points = paths["point"]
+    dt_minutes = int(integration_minutes)
+    period_desc = "hourly" if dt_minutes == 60 else f"{dt_minutes}-minute integration"
 
     ds_points = point_dataset_from_hour_df(
         df_hour=df_hour,
         R=R,
         bounding_box=bounding_box,
-        description="Hourly metrics as point-source detections",
+        description=f"{period_desc} metrics as point-source detections",
     )
 
     # Global attributes
     ds_points.attrs.update({
-        "title": "NGFS hourly point-source FRP metrics",
+        "title": "NGFS integrated point-source FRP metrics",
         "author": "Gonzalo A. Ferrada (gonzalo.ferrada@noaa.gov)",
         "institution": "CIRES/CU Boulder, GSL/NOAA",
         "source": "NGFS point detections (https://cimss.ssec.wisc.edu/ngfs/)",
         "history": f"created {datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')}",
         "creation_date_utc": datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ'),
+        "valid_date_start": valid_date_start,
+        "valid_date_end": valid_date_end,
+        "integration_minutes": dt_minutes,
         # "Conventions": "CF-1.8",
     })
     
@@ -838,19 +930,42 @@ def _merge_variable(prefer_east, presence_mask, arr_east, arr_west, fill_value=D
     return merged
 
 def _point_ds_to_dataframe(ds: xr.Dataset) -> pd.DataFrame:
-    df = ds.to_dataframe().reset_index()
-    if "point" in df.columns:
-        df = df.drop(columns=["point"])
+    if "point" not in ds.dims:
+        raise ValueError("Point dataset missing 'point' dimension.")
+
+    point_count = int(ds.sizes["point"])
+    df = pd.DataFrame({
+        "time": pd.to_datetime(ds["time"].to_numpy(), errors="coerce"),
+        "lat": np.asarray(ds["lat"].to_numpy(), dtype="float32"),
+        "lon": np.asarray(ds["lon"].to_numpy(), dtype="float32"),
+    })
+    if len(df) != point_count:
+        raise ValueError("Point dataset coordinate lengths are inconsistent.")
+
+    for var_name, da in ds.data_vars.items():
+        if "point" not in da.dims:
+            continue
+        if da.ndim == 1:
+            df[var_name] = da.to_numpy()
+            continue
+        if da.ndim == 2 and "corner" in da.dims:
+            vals = np.asarray(da.transpose("point", "corner").to_numpy())
+            if vals.shape[1] != CORNER_COUNT:
+                raise ValueError(f"Expected {CORNER_COUNT} corners for variable '{var_name}'.")
+            for i in range(1, CORNER_COUNT + 1):
+                df[f"{var_name}_{i}"] = vals[:, i - 1]
+            continue
+        raise ValueError(f"Unsupported point variable shape in merge input: {var_name} dims={da.dims}")
+
     key_cols = ["time", "lat", "lon"]
     for col in key_cols:
         if col not in df.columns:
             raise ValueError(f"Point dataset missing '{col}' coordinate.")
-    df["time"] = pd.to_datetime(df["time"], errors="coerce")
     df = df.dropna(subset=key_cols)
     df = df.sort_values(key_cols, kind="mergesort").reset_index(drop=True)
     return df
 
-def _merge_hourly_point_dataframes(df_e: pd.DataFrame, df_w: pd.DataFrame, pix_var_e: str, pix_var_w: str) -> pd.DataFrame:
+def _merge_window_point_dataframes(df_e: pd.DataFrame, df_w: pd.DataFrame, pix_var_e: str, pix_var_w: str) -> pd.DataFrame:
     key_cols = ["time", "lat", "lon"]
     vars_e = [c for c in df_e.columns if c not in key_cols]
     vars_w = [c for c in df_w.columns if c not in key_cols]
@@ -895,19 +1010,40 @@ def _merge_hourly_point_dataframes(df_e: pd.DataFrame, df_w: pd.DataFrame, pix_v
 def _point_dataframe_to_dataset(df: pd.DataFrame, attrs: dict[str, Any] | None = None) -> xr.Dataset:
     key_cols = ["time", "lat", "lon"]
     vars_out = [c for c in df.columns if c not in key_cols]
+    corner_bases = []
+    for base in ("lat_corners", "lon_corners", "LAT_CORNERS", "LON_CORNERS"):
+        needed = [f"{base}_{i}" for i in range(1, CORNER_COUNT + 1)]
+        if all(col in vars_out for col in needed):
+            corner_bases.append(base)
+    corner_cols = {f"{base}_{i}" for base in corner_bases for i in range(1, CORNER_COUNT + 1)}
+
     coords: dict[str, Any] = {
         "point": np.arange(len(df), dtype="int32"),
         "lat": ("point", df["lat"].to_numpy(dtype="float32")),
         "lon": ("point", df["lon"].to_numpy(dtype="float32")),
         "time": ("point", pd.to_datetime(df["time"], errors="coerce").to_numpy()),
     }
-    data_vars = {var: (("point",), df[var].to_numpy()) for var in vars_out}
+    if corner_bases:
+        coords["corner"] = np.arange(1, CORNER_COUNT + 1, dtype="int8")
+
+    data_vars = {
+        var: (("point",), df[var].to_numpy())
+        for var in vars_out
+        if var not in corner_cols
+    }
+    for base in corner_bases:
+        cols = [f"{base}_{i}" for i in range(1, CORNER_COUNT + 1)]
+        data_vars[base] = (("point", "corner"), df[cols].to_numpy(dtype="float32"))
+
     ds = xr.Dataset(data_vars=data_vars, coords=coords, attrs=(attrs or {}))
     ds.attrs["layout"] = "point"
     return ds
 
-def merge_hourly_satellite_grids(
-    hour,
+def merge_window_satellite_grids(
+    start_time,
+    integration_minutes,
+    valid_date_start,
+    valid_date_end,
     east_nc,
     west_nc,
     out_dir,
@@ -918,12 +1054,18 @@ def merge_hourly_satellite_grids(
     emissions_beta=0.38,
     emissions_debug=False,
 ):
-    paths = build_output_paths(out_dir, hour, R, sat_label="")
+    paths = build_output_paths(
+        out_dir,
+        start_time,
+        R,
+        sat_label="",
+        integration_minutes=integration_minutes,
+    )
     ymdh = paths["ymdh"]
     combined_path = paths["grid"]
     combined_point_path = paths["point"]
     combined_grid2d_path = paths["grid2d"]
-    msg(f"Merging GOES east/west grids for {ymdh}Z")
+    msg(f"Merging GOES east/west grids for integration window starting {ymdh}Z")
     with xr.open_dataset(east_nc) as ds_east, xr.open_dataset(west_nc) as ds_west:
         pix_var_e = _resolve_ds_var_name(ds_east, 'pixel_area_mean')
         pix_var_w = _resolve_ds_var_name(ds_west, 'pixel_area_mean')
@@ -931,16 +1073,19 @@ def merge_hourly_satellite_grids(
             raise ValueError("Both satellite NetCDFs must contain pixel area mean variable")
         df_e = _point_ds_to_dataframe(ds_east)
         df_w = _point_ds_to_dataframe(ds_west)
-        merged_df = _merge_hourly_point_dataframes(df_e, df_w, pix_var_e, pix_var_w)
+        merged_df = _merge_window_point_dataframes(df_e, df_w, pix_var_e, pix_var_w)
         merged_attrs = dict(ds_west.attrs)
         merged_attrs['description'] = (
-            ds_west.attrs.get('description', 'NGFS hourly metrics') +
+            ds_west.attrs.get('description', 'NGFS integrated metrics') +
             ' (east/west merged by minimum pixel area mean)'
         )
         merged_attrs['merge_note'] = (
             "Values pulled from satellite with smaller pixel area mean; "
             "flag_data_source indicates origin (1=east, 2=west)."
         )
+        merged_attrs["valid_date_start"] = valid_date_start
+        merged_attrs["valid_date_end"] = valid_date_end
+        merged_attrs["integration_minutes"] = int(integration_minutes)
         combined = _point_dataframe_to_dataset(merged_df, attrs=merged_attrs)
         combined['flag_data_source'].attrs.update({
             "long_name": "Source satellite for point (1=east, 2=west)",
@@ -971,21 +1116,26 @@ def merge_hourly_satellite_grids(
 # ======================================================================
 # User defined:
 # PARSE ARGUMENTS FOR REAL TIME PROCESSING
-if len(sys.argv) < 4:
-    print("Usage: python process_bysat_NGFS.py   YYYY-MM-DD_HH:MM:SS   path/to/file_goes_west.csv   path/to/file_goes_east.csv")
+if len(sys.argv) < 5:
+    print("Usage: python process_bysat_NGFS.py   YYYY-MM-DD_HH:MM:SS   integration_minutes   path/to/goes_west_dir   path/to/goes_east_dir")
     sys.exit(1)
 
 arg_timestamp = sys.argv[1]
+arg_integration_minutes = sys.argv[2]
 try:
-    # Parse format: 2026-02-25_18:00:00
     current_time = datetime.strptime(arg_timestamp, "%Y-%m-%d_%H:%M:%S")
-    # Ensure consistency (naive UTC as used in the script)
-    target_hour = normalize_hour_utc_naive(current_time).replace(minute=0, second=0, microsecond=0)
+    integration_minutes = int(arg_integration_minutes)
+    if integration_minutes <= 0:
+        raise ValueError
+    start_time = normalize_hour_utc_naive(current_time)
+    end_time = start_time + timedelta(minutes=integration_minutes)
+    valid_date_start = start_time.strftime("%Y-%m-%d_%H:%M:%S")
+    valid_date_end = end_time.strftime("%Y-%m-%d_%H:%M:%S")
 except ValueError:
-    print("Error: Timestamp must be in format YYYY-MM-DD_HH:MM:SS")
+    print("Error: Timestamp must be YYYY-MM-DD_HH:MM:SS and integration_minutes must be a positive integer.")
     sys.exit(1)
 
-msg(f"Processing single hour: {target_hour}")
+msg(f"Processing integration window: {valid_date_start} -> {valid_date_end} ({integration_minutes} min)")
 
 # Save options:
 save_netcdf             = True
@@ -1006,7 +1156,7 @@ path_netcdf = path_main + "/output"
 # End user definitions
 # No further modifications needed beyond this point
 # ======================================================================
-code_version = "v0.31"
+code_version = "v0.4"
 if "cove_version" not in globals():
     cove_version = code_version
 # output grid:
@@ -1028,52 +1178,79 @@ if estimate_emissions:
 # Create output directories:
 checkDir(path_netcdf)
 
-# construct full file path of ngfs:
-file_w = sys.argv[2]
-file_e = sys.argv[3]
-checkFile(file_w)
-checkFile(file_e)
+# Input directories containing daily NGFS CSV files:
+data_dir_w = sys.argv[3]
+data_dir_e = sys.argv[4]
+checkInputDir(data_dir_w)
+checkInputDir(data_dir_e)
     
-sat_hour_files = {'w': {}, 'e': {}}
+sat_window_files = {}
 try:
-    # Read the wildfire data from the CSV file
-    msg(f"Reading data from {file_w}")
-    dfw = pd.read_csv(file_w)
-    
-    msg(f"Reading data from {file_e}")
-    dfe = pd.read_csv(file_e)
-    
     sat_datasets = [
-        ('w', dfw, 'GOES-18'),
-        ('e', dfe, 'GOES-19'),
+        ('w', 'GOES-18', data_dir_w),
+        ('e', 'GOES-19', data_dir_e),
     ]
-    for sat_label, df_raw, sat_name in sat_datasets:
-        msg(f"Processing {sat_name} detections ({sat_label})")
-        df = df_raw.copy()
+    window_day_list = window_dates(start_time, end_time)
+    for sat_label, sat_platform, sat_dir in sat_datasets:
+        msg(f"Processing {sat_platform} detections ({sat_label}) from directory: {sat_dir}")
+
+        csv_files = []
+        missing_files = []
+        for d in window_day_list:
+            fpath = daily_ngfs_csv_path(sat_dir, sat_platform, d)
+            if fpath.is_file():
+                csv_files.append(fpath)
+            else:
+                missing_files.append(fpath)
+
+        if missing_files:
+            msg(
+                f"{sat_platform}: {len(missing_files)} daily file(s) missing for requested window. "
+                f"Continuing with available files."
+            )
+            for mf in missing_files:
+                msg(f"Missing: {mf}")
+
+        if not csv_files:
+            msg(f"No input CSV files found for {sat_platform} in requested window dates.")
+            continue
+
+        frames = []
+        for fpath in csv_files:
+            msg(f"Reading data from {fpath}")
+            frames.append(pd.read_csv(fpath))
+        df = pd.concat(frames, ignore_index=True)
         
-        # Define columns for pixel center point and the four corners
+        # Define numeric columns for pixel center point and pixel corners.
         cols_to_check = ['latitude', 'longitude', 'frp']
+        numeric_cols = cols_to_check + ['pixel_area'] + LAT_CORNER_COLS + LON_CORNER_COLS
         
         # Remove rows with missing values
-        for col in cols_to_check:
-            df[col] = pd.to_numeric(df[col], errors='coerce')
+        for col in numeric_cols:
+            if col in df.columns:
+                df[col] = pd.to_numeric(df[col], errors='coerce')
         df.dropna(subset=cols_to_check, inplace=True)
         
         # Keep only columns we use:
-        df = df[[
+        base_cols = [
             "acq_date_time", "latitude", "longitude", "frp",
             "pixel_area", "confidence", "quality_flag", "type",
-            "known_incident_type"
-        ]]
+            "known_incident_type",
+        ]
+        missing_base = [c for c in base_cols if c not in df.columns]
+        if missing_base:
+            raise ValueError(f"Input CSV is missing required columns: {missing_base}")
+        corner_cols = [c for c in (LAT_CORNER_COLS + LON_CORNER_COLS) if c in df.columns]
+        df = df[base_cols + corner_cols]
 
-        # Parse timestamps once, keep only the requested hour before regridding.
+        # Parse timestamps once, keep only the requested integration window before regridding.
         df["acq_date_time"] = pd.to_datetime(df["acq_date_time"], utc=True, errors="coerce")
         df.dropna(subset=["acq_date_time"], inplace=True)
-        target_hour_utc = pd.Timestamp(target_hour, tz="UTC")
-        next_hour_utc = target_hour_utc + pd.Timedelta(hours=1)
-        df = df[(df["acq_date_time"] >= target_hour_utc) & (df["acq_date_time"] < next_hour_utc)]
+        start_time_utc = pd.Timestamp(start_time, tz="UTC")
+        end_time_utc = pd.Timestamp(end_time, tz="UTC")
+        df = df[(df["acq_date_time"] >= start_time_utc) & (df["acq_date_time"] < end_time_utc)]
         if df.empty:
-            msg(f"No detections found for {sat_name} during target hour {target_hour}.")
+            msg(f"No detections found for {sat_platform} during requested window.")
             continue
         
         # Filter for bounding box
@@ -1110,26 +1287,35 @@ try:
         # Remove type == 3 and 4:
         df.drop(df[df['type'].isin([3, 4])].index, inplace=True)
         
-        # Regrid and aggregate by hour:
+        # Regrid and aggregate by hour bins for all detections in the selected window.
         df_hourly = hourly_regrid_metrics(df, bounding_box, R)
-        
-        # --- FILTER FOR THE SPECIFIC TARGET HOUR ONLY ---
-        df_h = df_hourly[df_hourly['hour'] == target_hour]
 
         # Save
-        if save_netcdf and not df_h.empty:
-            # Process strictly the target hour
-            nc_paths = write_hour_products_nc(df_h, path_netcdf, R, bounding_box, sat_label=sat_label)
+        if save_netcdf and not df_hourly.empty:
+            nc_paths = write_window_products_nc(
+                df_hourly,
+                path_netcdf,
+                R,
+                bounding_box,
+                start_time=start_time,
+                valid_date_start=valid_date_start,
+                valid_date_end=valid_date_end,
+                integration_minutes=integration_minutes,
+                sat_label=sat_label,
+            )
             if nc_paths:
-                sat_hour_files[sat_label][target_hour] = nc_paths
+                sat_window_files[sat_label] = nc_paths
     
     if save_netcdf:
-        # Merge if both satellites have data for the target hour
-        if target_hour in sat_hour_files['e'] and target_hour in sat_hour_files['w']:
-            merge_hourly_satellite_grids(
-                target_hour,
-                sat_hour_files['e'][target_hour]["grid"],
-                sat_hour_files['w'][target_hour]["grid"],
+        # Merge if both satellites have data for the requested integration window.
+        if "e" in sat_window_files and "w" in sat_window_files:
+            merge_window_satellite_grids(
+                start_time,
+                integration_minutes,
+                valid_date_start,
+                valid_date_end,
+                sat_window_files['e']["grid"],
+                sat_window_files['w']["grid"],
                 path_netcdf,
                 R,
                 bounding_box,
@@ -1140,19 +1326,19 @@ try:
             )
             if remove_intermediate:
                 for sat_label in ("e", "w"):
-                    sat_paths = sat_hour_files.get(sat_label, {}).get(target_hour)
+                    sat_paths = sat_window_files.get(sat_label)
                     if not sat_paths:
                         continue
                     remove_file_if_exists(sat_paths.get("grid"))
                     remove_file_if_exists(sat_paths.get("point"))
                     remove_file_if_exists(sat_paths.get("grid2d"))
         else:
-            msg(f"Skipping merge: detections for {target_hour} not available in both GOES-18 and GOES-19.")
+            msg("Skipping merge: detections in the requested window are not available in both GOES-18 and GOES-19.")
         
     
 
 except FileNotFoundError:
-    print(f"Error: The file(s) '{file_e}' and/or '{file_w}' was/were not found.")
+    print("Error: One or more required daily NGFS files could not be found.")
 except ImportError:
     print("Error: This script requires pandas, matplotlib, and cartopy.")
     print("Please install them using: pip install pandas matplotlib cartopy")
