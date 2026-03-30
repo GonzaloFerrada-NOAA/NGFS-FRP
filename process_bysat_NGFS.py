@@ -118,21 +118,20 @@ def _first_valid(s: pd.Series):
     s = s.dropna()
     return s.iloc[0] if not s.empty else np.nan
 
-def hourly_regrid_metrics(df, bounding_box, R):
+def window_regrid_metrics(df, bounding_box, R, window_start=None):
     """
-    Aggregate per (hour, original lat, original lon) without coordinate snapping.
+    Aggregate over the requested processing window per (lat, lon).
+    Uses a single time label (`hour`) equal to window_start when provided.
     """
     df = df.copy()
     df['acq_date_time'] = pd.to_datetime(df['acq_date_time'], utc=True, errors='coerce')
-    
-    # GAF this is wrong and makes no sense. Changing it to the left edge, so that
-    # fires detected bewteen 2 and 3 pm are labeled as 2 pm, not 3 pm. This makes more
-    # sense to the model since at the 2 pm integration it reads the averaged 
-    # FRP/emissions for that hour. 
-    # define hour key as the RIGHT edge of the window (HH)
-    # df['hour'] = df['acq_date_time'].dt.floor('h') + pd.Timedelta(hours=1)
-    # define hour key as the LOWER edge of the window (HH)
-    df['hour'] = df['acq_date_time'].dt.floor('h').dt.tz_localize(None)
+
+    if window_start is not None:
+        hour_label = normalize_hour_utc_naive(window_start)
+        df['hour'] = pd.Timestamp(hour_label)
+    else:
+        # Backward-compatible fallback (hourly buckets).
+        df['hour'] = df['acq_date_time'].dt.floor('h').dt.tz_localize(None)
 
     keys = ['hour', 'latitude', 'longitude']
 
@@ -261,15 +260,15 @@ def rename_ds_for_output(ds: xr.Dataset, meta: pd.DataFrame | None = None) -> xr
         return ds
     return ds.rename(rename_map)
 
-def point_dataset_from_hour_df(df_hour, R, bounding_box, description):
-    if df_hour.empty:
+def point_dataset_from_window_df(df_window, R, bounding_box, description):
+    if df_window.empty:
         raise ValueError("Cannot build point dataset from empty aggregated dataframe.")
 
-    if "hour" in df_hour.columns:
-        point_time = pd.to_datetime(df_hour["hour"], errors="coerce")
+    if "hour" in df_window.columns:
+        point_time = pd.to_datetime(df_window["hour"], errors="coerce")
     else:
-        fallback_time = normalize_hour_utc_naive(df_hour['acq_date_time'].iloc[0])
-        point_time = pd.Series(np.repeat(np.datetime64(fallback_time), len(df_hour)))
+        fallback_time = normalize_hour_utc_naive(df_window['acq_date_time'].iloc[0])
+        point_time = pd.Series(np.repeat(np.datetime64(fallback_time), len(df_window)))
 
     fields = [c for c in [
             'frp_total', 'frp_mean', 'frp_std', 'frp_max',
@@ -279,29 +278,29 @@ def point_dataset_from_hour_df(df_hour, R, bounding_box, description):
             'confidence', 'quality_flag', 'type', 'known_incident_type',
             'flag_data_source',
          ]
-         if c in df_hour.columns]
+         if c in df_window.columns]
 
-    point_count = len(df_hour)
+    point_count = len(df_window)
     coords: dict[str, Any] = {
         "point": np.arange(point_count, dtype="int32"),
-        "lat": ("point", df_hour["latitude"].to_numpy(dtype="float32")),
-        "lon": ("point", df_hour["longitude"].to_numpy(dtype="float32")),
+        "lat": ("point", df_window["latitude"].to_numpy(dtype="float32")),
+        "lon": ("point", df_window["longitude"].to_numpy(dtype="float32")),
         "time": ("point", point_time.to_numpy(dtype="datetime64[ns]")),
     }
     data_vars: dict[str, Any] = {
-        f: (("point",), df_hour[f].to_numpy()) for f in fields
+        f: (("point",), df_window[f].to_numpy()) for f in fields
     }
-    has_lat_corners = all(c in df_hour.columns for c in LAT_CORNER_COLS)
-    has_lon_corners = all(c in df_hour.columns for c in LON_CORNER_COLS)
+    has_lat_corners = all(c in df_window.columns for c in LAT_CORNER_COLS)
+    has_lon_corners = all(c in df_window.columns for c in LON_CORNER_COLS)
     if has_lat_corners and has_lon_corners:
         coords["corner"] = np.arange(1, CORNER_COUNT + 1, dtype="int8")
         data_vars["lat_corners"] = (
             ("point", "corner"),
-            df_hour[LAT_CORNER_COLS].to_numpy(dtype="float32"),
+            df_window[LAT_CORNER_COLS].to_numpy(dtype="float32"),
         )
         data_vars["lon_corners"] = (
             ("point", "corner"),
-            df_hour[LON_CORNER_COLS].to_numpy(dtype="float32"),
+            df_window[LON_CORNER_COLS].to_numpy(dtype="float32"),
         )
 
     ds = xr.Dataset(
@@ -550,7 +549,7 @@ def write_ngfs_netcdf(ds: xr.Dataset, out_path: Path | str, meta: pd.DataFrame |
     return out_path
 
 def write_window_products_nc(
-    df_hour,
+    df_window,
     out_dir,
     R,
     bounding_box,
@@ -564,7 +563,7 @@ def write_window_products_nc(
     emissions_beta=0.38,
     emissions_debug=False,
 ):
-    if df_hour.empty:
+    if df_window.empty:
         return None
 
     paths = build_output_paths(
@@ -579,8 +578,8 @@ def write_window_products_nc(
     dt_minutes = int(integration_minutes)
     period_desc = "hourly" if dt_minutes == 60 else f"{dt_minutes}-minute integration"
 
-    ds_points = point_dataset_from_hour_df(
-        df_hour=df_hour,
+    ds_points = point_dataset_from_window_df(
+        df_window=df_window,
         R=R,
         bounding_box=bounding_box,
         description=f"{period_desc} metrics as point-source detections",
@@ -656,12 +655,11 @@ emissions_debug         = False
 # Paths:
 path_main   = "/gpfs/f6/drsa-fire3/scratch/Gonzalo.Ferrada/FIRE/NGFS"
 path_netcdf = path_main + "/output"
-# path_netcdf = sys.argv[4]
 
 # End user definitions
 # No further modifications needed beyond this point
 # ======================================================================
-code_version = "v0.5"
+code_version = "v0.51"
 if "cove_version" not in globals():
     cove_version = code_version
 # output grid:
@@ -812,10 +810,10 @@ try:
     if selected_frames:
         detections = pd.concat(selected_frames, ignore_index=True)
         # Aggregate by hour and original pixel coordinates after static-mask filtering.
-        df_hourly = hourly_regrid_metrics(detections, bounding_box, R)
-        if save_netcdf and not df_hourly.empty:
+        df_window = window_regrid_metrics(detections, bounding_box, R, window_start=start_time)
+        if save_netcdf and not df_window.empty:
             write_window_products_nc(
-                df_hourly,
+                df_window,
                 path_netcdf,
                 R,
                 bounding_box,
