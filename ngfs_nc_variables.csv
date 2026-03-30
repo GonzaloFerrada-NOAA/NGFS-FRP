@@ -8,13 +8,16 @@ FRP_TOTAL,Total FRP (SUM of all FRPs) in current grid cell,MW,float32
 FRP_MEAN,Mean FRP (FRP_TOTAL / NOBS) in current grid cell,MW,float32
 FRP_STD,Standard deviation of FRP detections in grid cell,MW,float32
 FRP_MAX,Maximum FRP detection in grid cell,MW,float32
-FRP_DENSITY,FRP density over detected pixel area (FRP_TOTAL / PIXEL_AREA_TOTAL),MW km-2,float32
+FRP_DENSITY,FRP density (FRP_TOTAL / PIXEL_AREA_TOTAL),MW km-2,float32
+FRP_FEATURE,Mean feature FRP,MW,float32
 PIXEL_AREA_TOTAL,SUM of all pixel_area in current grid cell,km2,float32
-PIXEL_AREA_MEAN,Mean detected pixel area (PIXEL_AREA_MEAN / NOBS),km2,float32
-GRID_AREA,Grid cell area,km2,float32
+PIXEL_AREA,Pixel area,km2,float32
+PIXEL_AREA_MIN,Min pixel area,km2,float32
+PIXEL_AREA_MAX,Max pixel area,km2,float32
 NOBS,Number of GOES detections weighted in grid cell,#,int16
 FLAG_CONFIDENCE,NGFS confidence flag (min value within nobs),#,int16
 FLAG_QUALITY,NGFS quality flag (1 or min within nobs),#,int16
 FLAG_TYPE,NGFS detection type flag (1 or min within nobs),#,int16
 FLAG_KNOWN_INCIDENT,NGFS known incident type (mode within nobs),#,int16
-FRE,Fire radiative energy over the current dt (3600 s),MJ,float32
+FRE,Fire radiative energy,MJ,float32
+DURATION_MAX,Duration of fire,days,float32

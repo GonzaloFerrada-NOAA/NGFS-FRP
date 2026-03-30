@@ -41,7 +41,7 @@ def regrid_goes_to_target(goes_file, target_coords, target_shape, max_dist_degre
 if __name__ == "__main__":
     goes18_file = 'goes18_abi_conus_lat_lon.nc'
     goes19_file = 'goes19_abi_conus_lat_lon.nc'
-    ngfs_file = 'NGFS_EF_A2024.061.CONUS.r0.01.nc'
+    ngfs_file = 'NGFS_STATIC_A2024.061.CONUS.r0.01.nc'
     
     for f in [goes18_file, goes19_file, ngfs_file]:
         if not os.path.exists(f):
@@ -80,10 +80,11 @@ if __name__ == "__main__":
         # 3. Apply the buffer zone condition (<= 5% difference)
         # We must ensure both pixels are actually valid (not np.inf)
         valid_both = (area_18 != np.inf) & (area_19 != np.inf)
-        buffer_zone = valid_both & (relative_diff <= 0.05)
+        # buffer_zone = valid_both & (relative_diff <= 0.05)
+        # buffer_zone = valid_both & (relative_diff <= 0.0)
         
         # Overwrite the base conditions with 3 where the buffer applies
-        mask[buffer_zone] = 3
+        # mask[buffer_zone] = 3
         
         # --- PART 4: WRITE TO NGFS NETCDF ---
         print(f"Writing mask to {ngfs_file}...")

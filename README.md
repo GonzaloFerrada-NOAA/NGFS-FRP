@@ -12,7 +12,10 @@ or...
 ## process_bysat_NGFS.py
 Main tool that reads NGFS inputs in CSV format and grids them into a target grid of user-specified resolution. It applied multiple filters (QA flags), aggregates the data hourly, calculates metrics and merge data from fires observed by both GOES-East and -West based on pixel area. The resulting outputs are saved in gridded/ in both netcdf (2-D) and csv (1-D) formats. The aggregation method follows Darmenov and da Silva (2015), i.e., the QFED dataset, and it geolocates the input coordinates using the nearest neighbor approach.
 
-## convert2rave.py
+## process_bulk.sh
+Bash script to process NGFS files in bulk. E.g., for retros. User only needs to modify their Python environment path.
+
+## convert2rave.py (deprecated)
 (Temporary tool) Produces emissions of PM2.5 to be used as input to the cheMPAS-Fire model. It scales the emissions based on RAVE inputs (needed for processing). Note that for this tool to work properly, the NGFS data needs to be at a resolution of 0.03 degrees. An analogous tool in MATLAB is included.
 
 ## Sample data
@@ -23,11 +26,23 @@ Outputs in csv and netcdf formats from the main tool.
 
 
 # Change log
+#### v0.5 (30 Mar 2026)
+- Using static data of satellite pixel size. This eliminates the need of creation of intermediate files.
+- Remove GRID_AREA and PIXEL_AREA_TOTAL variables since we only use pixel areas. 
+- Renamed PIXEL_AREA_MEAN as PIXEL_AREA.
+- Include FRP_FEATURE and DURATION_MAX.
+
 #### v0.4 (26 Mar 2026)
 - Modified how the script is called, to make it more flexible for real-time.
-`process_bysat_NGFS.py  YYYY-MM-DD_HH:MM:SS  integration_minutes  path/to/goes_west_dir  path/to/goes_east_dir`
+
+```process_bysat_NGFS.py  YYYY-MM-DD_HH:MM:SS  integration_minutes  path/to/goes_west_dir  path/to/goes_east_dir```
 - Script automatically construct CSV file names and includes them for processing. Useful in case the user requests a time window that goes beyond midnight.
-- FRE is now calculated using the actual number of observations over the time window requested, rather than assuming 12 observations per hours (Before: FRE = FRP * 12 * 300; Now: FRE = FRP * Nobs * 300)
+- FRE is now calculated using the actual number of observations over the time window requested, rather than assuming 12 observations per hours:
+
+Before: `FRE = FRP * 12 * 300` over an hour of integration.
+
+Now: `FRE = FRP * Nobs * 300` over whichever time window.
+
 - Includes two new variables `lat_corners` and `lon_corners` that contain the corner coordinates of the current GOES pixel. Useful for regridding.
 
 #### v0.31 (12 Feb 2026)
