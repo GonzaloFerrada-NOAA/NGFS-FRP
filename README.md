@@ -23,7 +23,7 @@ Outputs in csv and netcdf formats from the main tool.
 
 
 ## Change log
-#### v0.6 (30 Mar 2026)
+#### v0.6 (27 Apr 2026)
 - Updating emissions calculations (emission factors) to use updated beta values and EPA's ecoregions map.
 - Code now reads the BETA_MAP variable from the static file to calculate the emissions - before beta was a hardcoded constant (= 0.38).
 
