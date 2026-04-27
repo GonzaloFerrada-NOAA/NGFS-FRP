@@ -41,7 +41,7 @@ def regrid_goes_to_target(goes_file, target_coords, target_shape, max_dist_degre
 if __name__ == "__main__":
     goes18_file = 'goes18_abi_conus_lat_lon.nc'
     goes19_file = 'goes19_abi_conus_lat_lon.nc'
-    ngfs_file = 'NGFS_STATIC_A2024.061.CONUS.r0.01.nc'
+    ngfs_file = 'NGFS_STATIC_A2024.061.CONUS.r0.03.nc'
     
     for f in [goes18_file, goes19_file, ngfs_file]:
         if not os.path.exists(f):

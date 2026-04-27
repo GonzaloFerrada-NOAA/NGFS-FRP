@@ -321,6 +321,23 @@ def load_static_emissions_lookup(static_file_path, R):
         raise FileNotFoundError(f"Static emissions file not found: {static_path}")
 
     with xr.open_dataset(static_path) as ds_s:
+        required_vars = [
+            "lat",
+            "lon",
+            "MASK_GOES_SOURCE",
+            "EFACTOR_PM25",
+            "EFACTOR_FLAMING_PM25",
+            "BETA_MAP",
+            "BETA_VFEI",
+            "land_cover_fraction",
+        ]
+        missing_vars = [var for var in required_vars if var not in ds_s]
+        if missing_vars:
+            raise ValueError(
+                "Static emissions file is missing required variable(s): "
+                + ", ".join(missing_vars)
+            )
+
         s_lats = np.asarray(ds_s["lat"].to_numpy(), dtype=np.float32)
         s_lons = np.asarray(ds_s["lon"].to_numpy(), dtype=np.float32)
         if s_lats.size > 1 and s_lons.size > 1:
@@ -329,13 +346,12 @@ def load_static_emissions_lookup(static_file_path, R):
             R_static = float((r_lat + r_lon) / 2.0)
         else:
             R_static = float(R)
-        if "MASK_GOES_SOURCE" not in ds_s:
-            raise ValueError("Static file must include MASK_GOES_SOURCE for satellite source selection.")
         mask_raw = np.asarray(ds_s["MASK_GOES_SOURCE"].to_numpy())
         # xarray may decode _FillValue to NaN; map non-finite values to -1 before int cast.
         mask_goes_source = np.where(np.isfinite(mask_raw), mask_raw, -1).astype(np.int16, copy=False).ravel()
         ef_std = np.asarray(ds_s["EFACTOR_PM25"].to_numpy(), dtype=np.float32).ravel()
         ef_flam = np.asarray(ds_s["EFACTOR_FLAMING_PM25"].to_numpy(), dtype=np.float32).ravel()
+        beta_map = np.asarray(ds_s["BETA_MAP"].to_numpy(), dtype=np.float32).ravel()
         beta_vfei = np.asarray(ds_s["BETA_VFEI"].to_numpy(), dtype=np.float32).ravel()
         lcf_raw = np.asarray(ds_s["land_cover_fraction"].to_numpy())
 
@@ -365,6 +381,7 @@ def load_static_emissions_lookup(static_file_path, R):
         "mask_goes_source_flat": mask_goes_source,
         "ef_std_flat": ef_std,
         "ef_flam_flat": ef_flam,
+        "beta_map_flat": beta_map,
         "beta_vfei_flat": beta_vfei,
         "land_cover_fraction_flat": lcf_flat,
     }
@@ -392,7 +409,7 @@ def select_satellite_rows_by_static_mask(df, static_lookup, sat_source_flag):
     out["flag_data_source"] = int(sat_source_flag)
     return out
 
-def append_pm25_emissions_to_points(ds_points, static_lookup, beta_val=0.38, debug=False):
+def append_pm25_emissions_to_points(ds_points, static_lookup, debug=False):
     fre_name = _resolve_ds_var_name(ds_points, "fre")
     incident_name = _resolve_ds_var_name(ds_points, "known_incident_type")
     if fre_name is None or incident_name is None:
@@ -416,10 +433,11 @@ def append_pm25_emissions_to_points(ds_points, static_lookup, beta_val=0.38, deb
 
     ef_std = np.take(static_lookup["ef_std_flat"], flat_idx)
     ef_flam = np.take(static_lookup["ef_flam_flat"], flat_idx)
+    beta_map = np.take(static_lookup["beta_map_flat"], flat_idx)
     beta_vfei = np.take(static_lookup["beta_vfei_flat"], flat_idx)
     ef_to_use = np.where(incident_flag == 2, ef_flam, ef_std)
 
-    emis_pm25 = fre * float(beta_val) * ef_to_use * 1e-3
+    emis_pm25 = fre * beta_map * ef_to_use * 1e-3
     emis_pm25_vfei = fre * beta_vfei * ef_to_use * 1e-3
     invalid = (~np.isfinite(fre)) | (fre == float(DEFAULT_FILL_VALUE))
     emis_pm25 = np.where(invalid, float(DEFAULT_FILL_VALUE), emis_pm25).astype(np.float32, copy=False)
@@ -429,7 +447,7 @@ def append_pm25_emissions_to_points(ds_points, static_lookup, beta_val=0.38, deb
     out["EMIS_PM25"] = (("point",), emis_pm25)
     out["EMIS_PM25"].attrs.update({
         "units": "kg",
-        "long_name": f"PM2.5 emissions calculated from NGFS FRE (Beta={beta_val})",
+        "long_name": "PM2.5 emissions calculated from NGFS FRE using BETA_MAP",
         "coordinates": "lat lon time",
     })
     out["EMIS_PM25_VFEI"] = (("point",), emis_pm25_vfei)
@@ -455,6 +473,18 @@ def append_pm25_emissions_to_points(ds_points, static_lookup, beta_val=0.38, deb
         out["EFACTOR_PM25_USED"].attrs.update({
             "units": "g MJ-1",
             "long_name": "Emission factor selected by incident flag (flaming if flag==2, else standard)",
+            "coordinates": "lat lon time",
+        })
+        out["BETA_MAP"] = (("point",), beta_map.astype(np.float32, copy=False))
+        out["BETA_MAP"].attrs.update({
+            "units": "kg[dry-matter]/MJ",
+            "long_name": "Lookup BETA_MAP used for PM2.5 emissions",
+            "coordinates": "lat lon time",
+        })
+        out["BETA_VFEI"] = (("point",), beta_vfei.astype(np.float32, copy=False))
+        out["BETA_VFEI"].attrs.update({
+            "units": "kg[dry-matter]/MJ",
+            "long_name": "Lookup BETA_VFEI used for PM2.5 emissions diagnostics",
             "coordinates": "lat lon time",
         })
         if "land_cover_fraction_flat" in static_lookup:
@@ -560,7 +590,6 @@ def write_window_products_nc(
     sat_label="",
     estimate_emissions=False,
     emissions_lookup=None,
-    emissions_beta=0.38,
     emissions_debug=False,
 ):
     if df_window.empty:
@@ -606,7 +635,6 @@ def write_window_products_nc(
         ds_points = append_pm25_emissions_to_points(
             ds_points,
             static_lookup=emissions_lookup,
-            beta_val=emissions_beta,
             debug=emissions_debug,
         )
     
@@ -648,7 +676,6 @@ save_netcdf             = True
 save_netcdf_points      = False
 
 estimate_emissions      = True
-emissions_beta          = 0.38
 emissions_static_file   = None
 emissions_debug         = False
 
@@ -659,7 +686,7 @@ path_netcdf = path_main + "/output"
 # End user definitions
 # No further modifications needed beyond this point
 # ======================================================================
-code_version = "v0.51"
+code_version = "v0.6"
 if "cove_version" not in globals():
     cove_version = code_version
 # output grid:
@@ -824,7 +851,6 @@ try:
                 sat_label="",
                 estimate_emissions=estimate_emissions,
                 emissions_lookup=emissions_lookup,
-                emissions_beta=emissions_beta,
                 emissions_debug=emissions_debug,
             )
         else:

@@ -9,10 +9,10 @@ or...
 ```pip install pandas xarray numpy netcdf4 dask```
 
 ## Scripts
-### process_bysat_NGFS.py
+#### process_bysat_NGFS.py
 Main tool that reads NGFS inputs in CSV format and grids them into a target grid of user-specified resolution. It applied multiple filters (QA flags), aggregates the data hourly, calculates metrics and merge data from fires observed by both GOES-East and -West based on pixel area. The resulting outputs are saved in gridded/ in both netcdf (2-D) and csv (1-D) formats. The aggregation method follows Darmenov and da Silva (2015), i.e., the QFED dataset, and it geolocates the input coordinates using the nearest neighbor approach.
 
-### process_bulk.sh
+#### process_bulk.sh
 Bash script to process NGFS files in bulk. E.g., for retros. User only needs to modify their Python environment path.
 
 ## Sample data
@@ -22,8 +22,12 @@ NGFS input files from both GOES-18 and -19 for 2025-08-14.
 Outputs in csv and netcdf formats from the main tool.
 
 
-# Change log
-#### v0.5 (30 Mar 2026)
+## Change log
+#### v0.6 (30 Mar 2026)
+- Updating emissions calculations (emission factors) to use updated beta values and EPA's ecoregions map.
+- Code now reads the BETA_MAP variable from the static file to calculate the emissions - before beta was a hardcoded constant (= 0.38).
+
+#### v0.51 (30 Mar 2026)
 - Bug fix: hourly_regrid_metrics.
 
 #### v0.5 (30 Mar 2026)
