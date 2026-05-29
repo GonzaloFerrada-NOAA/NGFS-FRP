@@ -679,10 +679,6 @@ estimate_emissions      = True
 emissions_static_file   = None
 emissions_debug         = False
 
-# Paths:
-path_main   = "/gpfs/f6/drsa-fire3/scratch/Gonzalo.Ferrada/FIRE/NGFS"
-path_netcdf = path_main + "/output"
-
 # End user definitions
 # No further modifications needed beyond this point
 # ======================================================================
@@ -697,8 +693,13 @@ bounding_box    = np.array([-135.0, -50.0, 15.0, 55.0])
 # R               = 0.01 # Resolution in degrees
 R               = 0.01
 
+# Paths:
+REPO_DIR    = Path(__file__).resolve().parent
+path_main   = Path(os.environ.get("NGFS_DIR", REPO_DIR)).resolve()
+path_netcdf = Path(os.getenv("NGFS_OUTPUT", path_main / "output")).resolve()
+
 if emissions_static_file is None:
-    emissions_static_file = f"{path_main}/static/NGFS_STATIC_A2024.061.CONUS.r{R}.nc"
+    emissions_static_file = path_main / "static" / f"NGFS_STATIC_A2024.061.CONUS.r{R}.nc"
 
 msg(f"Loading static lookup (emissions + MASK_GOES_SOURCE): {emissions_static_file}")
 static_lookup = load_static_emissions_lookup(emissions_static_file, R)
