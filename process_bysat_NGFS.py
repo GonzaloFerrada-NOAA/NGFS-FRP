@@ -67,9 +67,9 @@ def build_output_paths(out_dir, start_like, R, sat_label="", integration_minutes
     if dt_minutes <= 0:
         raise ValueError("integration_minutes must be > 0.")
     period_tag = "hourly" if dt_minutes == 60 else f"{dt_minutes}-min"
-    file_tag = f"NGFS_{code_version}_{period_tag}"
+    file_tag = "ngfs_processed"
     suffix = f"_{sat_label.strip()}" if sat_label.strip() else ""
-    version_dir = Path(out_dir) / get_version_tag()
+    version_dir = Path(out_dir)
     checkDir(version_dir)
     return {
         "version_dir": version_dir,
