@@ -21,3 +21,4 @@ FLAG_TYPE,NGFS detection type flag (1 or min within nobs),#,int16
 FLAG_KNOWN_INCIDENT,NGFS known incident type (mode within nobs),#,int16
 FRE,Fire radiative energy,MJ,float32
 DURATION_MAX,Duration of fire,days,float32
+GRID_AREA,Spherical area of the output grid cell,km2,float32

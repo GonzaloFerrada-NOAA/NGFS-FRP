@@ -118,6 +118,33 @@ def _first_valid(s: pd.Series):
     s = s.dropna()
     return s.iloc[0] if not s.empty else np.nan
 
+def add_grid_cell_area(
+    df,
+    R,
+    lat_col: str = 'latitude',
+    area_col: str = 'grid_area_km2',
+    radius_km: float = 6371.0):
+    """
+    Compute spherical grid-cell area (km^2) for a regular lat/lon grid
+    of spacing R (degrees), using the *snapped* latitude as the cell center.
+    Adds a column `area_col` to df.
+    """
+
+    # angular sizes in radians
+    dlat = np.deg2rad(R)
+    dlon = np.deg2rad(R)
+
+    # cell-center latitude in radians
+    lat_center_rad = np.deg2rad(df[lat_col].to_numpy())
+
+    # edges
+    lat1 = lat_center_rad - dlat / 2.0
+    lat2 = lat_center_rad + dlat / 2.0
+
+    area = (radius_km**2) * np.abs(np.sin(lat2) - np.sin(lat1)) * dlon
+    df[area_col] = area
+    return df
+
 def window_regrid_metrics(df, bounding_box, R, window_start=None):
     """
     Aggregate over the requested processing window per (lat, lon).
@@ -276,7 +303,7 @@ def point_dataset_from_window_df(df_window, R, bounding_box, description):
             'frp_density', 'fre',
             'frp_feature', 'duration_max',
             'confidence', 'quality_flag', 'type', 'known_incident_type',
-            'flag_data_source',
+            'flag_data_source', 'grid_area',
          ]
          if c in df_window.columns]
 
@@ -682,7 +709,7 @@ emissions_debug         = False
 # End user definitions
 # No further modifications needed beyond this point
 # ======================================================================
-code_version = "v0.6"
+code_version = "v0.61"
 if "cove_version" not in globals():
     cove_version = code_version
 # output grid:
@@ -839,6 +866,7 @@ try:
         detections = pd.concat(selected_frames, ignore_index=True)
         # Aggregate by hour and original pixel coordinates after static-mask filtering.
         df_window = window_regrid_metrics(detections, bounding_box, R, window_start=start_time)
+        df_window = add_grid_cell_area(df_window, R=R, lat_col='latitude', area_col='grid_area')
         if save_netcdf and not df_window.empty:
             write_window_products_nc(
                 df_window,
