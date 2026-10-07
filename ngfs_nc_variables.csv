@@ -8,17 +8,14 @@ FRP_TOTAL,Total FRP (SUM of all FRPs) in current grid cell,MW,float32
 FRP_MEAN,Mean FRP (FRP_TOTAL / NOBS) in current grid cell,MW,float32
 FRP_STD,Standard deviation of FRP detections in grid cell,MW,float32
 FRP_MAX,Maximum FRP detection in grid cell,MW,float32
-FRP_DENSITY,FRP density (FRP_TOTAL / PIXEL_AREA_TOTAL),MW km-2,float32
+FRP_DENSITY,FRP density (FRP_MEAN / PIXEL_AREA),MW km-2,float32
 FRP_FEATURE,Mean feature FRP,MW,float32
-PIXEL_AREA_TOTAL,SUM of all pixel_area in current grid cell,km2,float32
 PIXEL_AREA,Pixel area,km2,float32
-PIXEL_AREA_MIN,Min pixel area,km2,float32
-PIXEL_AREA_MAX,Max pixel area,km2,float32
-NOBS,Number of GOES detections weighted in grid cell,#,int16
-FLAG_CONFIDENCE,NGFS confidence flag (min value within nobs),#,int16
-FLAG_QUALITY,NGFS quality flag (1 or min within nobs),#,int16
-FLAG_TYPE,NGFS detection type flag (1 or min within nobs),#,int16
-FLAG_KNOWN_INCIDENT,NGFS known incident type (mode within nobs),#,int16
+NOBS,"Number of GOES detections within period (if hourly, then 12 over CONUS is max)",#,int16
+FLAG_CONFIDENCE,Confidence in fire detection. Currently always nominal (=1).,#,int16
+FLAG_QUALITY,1:robust signal 3:persistence_approach,#,int16
+FLAG_TYPE,0:presumed_vegetation_fire 1:colocated_with_known_fire 5:likely_urban_source,#,int16
 FRE,Fire radiative energy,MJ,float32
-DURATION_MAX,Duration of fire,days,float32
+DURATION_MAX,Duration of fire,hours,float32
 GRID_AREA,Spherical area of the output grid cell,km2,float32
+FIRE_TYPE,1:Agricultural 2:Prescribed 3:Wilfire 4:WUI 5:Industrial 6:Unknown,#,int16

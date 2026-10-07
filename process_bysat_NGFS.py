@@ -53,6 +53,24 @@ CORNER_COUNT = 4
 LAT_CORNER_COLS = [f"latitude_c{i}" for i in range(1, CORNER_COUNT + 1)]
 LON_CORNER_COLS = [f"longitude_c{i}" for i in range(1, CORNER_COUNT + 1)]
 
+# NGFS 'type' values that are likely NOT fires (dropped before aggregation)
+NON_FIRE_TYPES = [2, 3, 4, 7, 8]
+
+# FIRE_TYPE codes (see ngfs_nc_variables.csv)
+FT_AGRICULTURAL = 1
+FT_PRESCRIBED   = 2
+FT_WILDFIRE     = 3
+FT_WUI          = 4   # placeholder: no source information yet
+FT_INDUSTRIAL   = 5   # placeholder: no source information yet
+FT_UNKNOWN      = 6
+
+# IGBP categories (values of the static file's `category` coordinate, not array positions)
+IGBP_CROPLAND        = 12
+IGBP_URBAN           = 13
+IGBP_CROPLAND_MOSAIC = 14
+AG_FRAC_MIN          = 0.4   # cropland + cropland mosaic fraction needed for an agricultural fire
+URBAN_FRAC_MIN       = 0.25  # urban fraction needed for a WUI fire
+
 def get_version_tag() -> str:
     return str(globals().get("cove_version", code_version))
 
@@ -114,6 +132,64 @@ def _mode_first(s: pd.Series):
     m = s.mode()
     return m.iloc[0] if len(m) else s.iloc[0]
 
+def _incident_agg(s: pd.Series):
+    """Pixel-level known incident: WF > RX > NULL (fires get upgraded from NULL as info arrives)."""
+    v = set(s.dropna())
+    if "WF" in v:
+        return "WF"
+    if "RX" in v:
+        return "RX"
+    return ""                                   # NULL / blank / anything else
+
+def _static_flat_index(p_lat, p_lon, static_lookup):
+    """Nearest static-grid cell (flattened index) for each point."""
+    R_static = float(static_lookup["R"])
+    if static_lookup["is_top_down"]:
+        lat_idx = np.rint((static_lookup["lat_max"] - p_lat) / R_static).astype(np.int64)
+    else:
+        lat_idx = np.rint((p_lat - static_lookup["lat_min"]) / R_static).astype(np.int64)
+    lon_idx = np.rint((p_lon - static_lookup["lon_min"]) / R_static).astype(np.int64)
+    lat_idx = np.clip(lat_idx, 0, static_lookup["nlat"] - 1)
+    lon_idx = np.clip(lon_idx, 0, static_lookup["nlon"] - 1)
+    return lat_idx * static_lookup["nlon"] + lon_idx
+
+def assign_fire_type(df_window: pd.DataFrame, static_lookup) -> pd.DataFrame:
+    """
+    Pixel-level FIRE_TYPE from the aggregated known incident + static IGBP land cover.
+    Decision tree (highest priority first):
+      3 Wildfire     : known_incident == WF
+      2 Prescribed   : known_incident == RX
+      1 Agricultural : NULL incident AND frac(cat 12) + frac(cat 14) >= AG_FRAC_MIN
+      4 WUI          : NULL incident AND frac(cat 13) >= URBAN_FRAC_MIN
+      5 Industrial   : placeholder (no information yet)
+      6 Unknown      : NULL incident and none of the above
+    Rules are assigned lowest -> highest priority so later lines overwrite earlier ones
+    (if a pixel meets both 1 and 4, Agricultural wins).
+    """
+    out = df_window.copy()
+    kit = out["known_incident_type"].fillna("").astype(str).to_numpy()
+    is_null = kit == ""
+
+    # Land cover fractions at each point: (ncat, npoints); NaN (no data) -> 0
+    flat_idx = _static_flat_index(
+        out["latitude"].to_numpy(dtype=np.float32),
+        out["longitude"].to_numpy(dtype=np.float32),
+        static_lookup,
+    )
+    lcf = np.nan_to_num(np.take(static_lookup["land_cover_fraction_flat"], flat_idx, axis=1), nan=0.0)
+    row = {int(c): i for i, c in enumerate(static_lookup["lc_categories"])}   # IGBP code -> row index
+    ag_frac = lcf[row[IGBP_CROPLAND]] + lcf[row[IGBP_CROPLAND_MOSAIC]]
+    urban_frac = lcf[row[IGBP_URBAN]]
+
+    ft = np.full(len(out), FT_UNKNOWN, dtype=np.int16)                      # 6
+    ft[is_null & (urban_frac >= URBAN_FRAC_MIN)] = FT_WUI                   # 4
+    ft[is_null & (ag_frac >= AG_FRAC_MIN)] = FT_AGRICULTURAL                # 1
+    ft[kit == "RX"] = FT_PRESCRIBED                                         # 2
+    ft[kit == "WF"] = FT_WILDFIRE                                           # 3
+
+    out["fire_type"] = ft
+    return out.drop(columns=["known_incident_type"])   # helper, not written
+
 def _first_valid(s: pd.Series):
     s = s.dropna()
     return s.iloc[0] if not s.empty else np.nan
@@ -126,7 +202,7 @@ def add_grid_cell_area(
     radius_km: float = 6371.0):
     """
     Compute spherical grid-cell area (km^2) for a regular lat/lon grid
-    of spacing R (degrees), using the *snapped* latitude as the cell center.
+    of spacing R (degrees), centered on the (original, unsnapped) pixel latitude.
     Adds a column `area_col` to df.
     """
 
@@ -173,14 +249,11 @@ def window_regrid_metrics(df, bounding_box, R, window_start=None):
         'frp_mean':         ('frp', 'mean'),
         'frp_std':          ('frp', lambda s: s.astype(float).std(ddof=0)),
         'frp_max':          ('frp', 'max'),
-        'pixel_area_total': ('pixel_area', 'sum'),
         'pixel_area':       ('pixel_area', 'mean'),
-        # 'pixel_area_min':   ('pixel_area', 'min'),
-        # 'pixel_area_max':   ('pixel_area', 'max'),
         'confidence':       ('confidence', _prefer_one_else_min),
         'quality_flag':     ('quality_flag', _prefer_one_zero_min),
-        'type':             ('type', _prefer_one_zero_min),
-        'known_incident_type': ('known_incident_type', _mode_first),
+        'type':             ('type', 'min'),                          # 1 > 5 -> keep min
+        'known_incident_type': ('known_incident_type', _incident_agg),  # WF > RX > NULL
     }
     if 'flag_data_source' in df.columns:
         named_aggs['flag_data_source'] = ('flag_data_source', _mode_first)
@@ -199,15 +272,16 @@ def window_regrid_metrics(df, bounding_box, R, window_start=None):
                  .sort_values(keys, kind='mergesort')
                  .reset_index(drop=True))
     
-    if {"frp_total", "pixel_area_total"}.issubset(out.columns):
-        denom = out["pixel_area_total"].astype(float).to_numpy()
-        frp_total = out["frp_total"].astype(float).to_numpy()
-        out["frp_density"] = np.where(denom > 0, frp_total / denom, 0.0)
+    if {"frp_mean", "pixel_area"}.issubset(out.columns):
+        # sum(frp)/sum(area) == mean(frp)/mean(area), so no need to carry pixel_area_total
+        denom = out["pixel_area"].astype(float).to_numpy()
+        frp_mean = out["frp_mean"].astype(float).to_numpy()
+        out["frp_density"] = np.where(denom > 0, frp_mean / np.where(denom > 0, denom, 1.0), 0.0)
     if {"frp_mean", "nobs"}.issubset(out.columns):
-        # FRE integration using nominal GOES cadence (5 min) times actual observation count.
-        out["fre"]         = out["frp_mean"] * (5.0 * out["nobs"].astype(float))
-    if "pixel_area_total" in out.columns:
-        out = out.drop(columns=["pixel_area_total"])
+        # FRE [MJ] = FRP [MW] x time [s]: nominal GOES CONUS cadence (300 s) times observation count.
+        out["fre"]         = out["frp_mean"] * (300.0 * out["nobs"].astype(float))
+    if "duration_max" in out.columns:
+        out["duration_max"] = out["duration_max"] * 24.0   # days -> hours
         
     return out  # one row per (hour, lat, lon) with metrics and nobs
 
@@ -218,7 +292,7 @@ OUTPUT_ALIASES = {
     "confidence": "FLAG_CONFIDENCE",
     "quality_flag": "FLAG_QUALITY",
     "type": "FLAG_TYPE",
-    "known_incident_type": "FLAG_KNOWN_INCIDENT",
+    "fire_type": "FIRE_TYPE",
     "lat_corners": "LAT_CORNERS",
     "lon_corners": "LON_CORNERS",
 }
@@ -302,7 +376,7 @@ def point_dataset_from_window_df(df_window, R, bounding_box, description):
             'pixel_area', 'nobs',
             'frp_density', 'fre',
             'frp_feature', 'duration_max',
-            'confidence', 'quality_flag', 'type', 'known_incident_type',
+            'confidence', 'quality_flag', 'type', 'fire_type',
             'flag_data_source', 'grid_area',
          ]
          if c in df_window.columns]
@@ -396,6 +470,11 @@ def load_static_emissions_lookup(static_file_path, R):
                 "land_cover_fraction spatial dimensions do not match lat/lon dimensions in static file."
             )
         lcf_flat = lcf_moved.reshape(17, -1)
+        # IGBP code of each class row (needed to find categories 12/13/14 regardless of indexing)
+        if "category" in ds_s:
+            lc_categories = np.asarray(ds_s["category"].to_numpy()).astype(int)
+        else:
+            lc_categories = np.arange(1, 18, dtype=int)   # assume IGBP 1..17
 
     return {
         "R": R_static,
@@ -411,23 +490,14 @@ def load_static_emissions_lookup(static_file_path, R):
         "beta_map_flat": beta_map,
         "beta_vfei_flat": beta_vfei,
         "land_cover_fraction_flat": lcf_flat,
+        "lc_categories": lc_categories,
     }
 
 def select_satellite_rows_by_static_mask(df, static_lookup, sat_source_flag):
     """Filter detections using static MASK_GOES_SOURCE (1=east GOES-19, 2=west GOES-18)."""
     p_lat = np.asarray(df["latitude"].to_numpy(), dtype=np.float32)
     p_lon = np.asarray(df["longitude"].to_numpy(), dtype=np.float32)
-    R_static = float(static_lookup["R"])
-
-    if static_lookup["is_top_down"]:
-        lat_idx = np.rint((static_lookup["lat_max"] - p_lat) / R_static).astype(np.int64)
-    else:
-        lat_idx = np.rint((p_lat - static_lookup["lat_min"]) / R_static).astype(np.int64)
-    lon_idx = np.rint((p_lon - static_lookup["lon_min"]) / R_static).astype(np.int64)
-
-    lat_idx = np.clip(lat_idx, 0, static_lookup["nlat"] - 1)
-    lon_idx = np.clip(lon_idx, 0, static_lookup["nlon"] - 1)
-    flat_idx = lat_idx * static_lookup["nlon"] + lon_idx
+    flat_idx = _static_flat_index(p_lat, p_lon, static_lookup)
 
     mask_source = np.take(static_lookup["mask_goes_source_flat"], flat_idx).astype(np.int16, copy=False)
     out = df.copy()
@@ -438,31 +508,22 @@ def select_satellite_rows_by_static_mask(df, static_lookup, sat_source_flag):
 
 def append_pm25_emissions_to_points(ds_points, static_lookup, debug=False):
     fre_name = _resolve_ds_var_name(ds_points, "fre")
-    incident_name = _resolve_ds_var_name(ds_points, "known_incident_type")
-    if fre_name is None or incident_name is None:
-        raise ValueError("Merged dataset must contain FRE and FLAG_KNOWN_INCIDENT variables for emissions.")
+    fire_type_name = _resolve_ds_var_name(ds_points, "fire_type")
+    if fre_name is None or fire_type_name is None:
+        raise ValueError("Merged dataset must contain FRE and FIRE_TYPE variables for emissions.")
 
     p_lat = np.asarray(ds_points["lat"].to_numpy(), dtype=np.float32)
     p_lon = np.asarray(ds_points["lon"].to_numpy(), dtype=np.float32)
     fre = np.asarray(ds_points[fre_name].to_numpy(), dtype=np.float32)
-    incident_flag = np.asarray(ds_points[incident_name].to_numpy())
+    fire_type = np.asarray(ds_points[fire_type_name].to_numpy())
 
-    R_static = float(static_lookup["R"])
-    if static_lookup["is_top_down"]:
-        lat_idx = np.rint((static_lookup["lat_max"] - p_lat) / R_static).astype(np.int64)
-    else:
-        lat_idx = np.rint((p_lat - static_lookup["lat_min"]) / R_static).astype(np.int64)
-    lon_idx = np.rint((p_lon - static_lookup["lon_min"]) / R_static).astype(np.int64)
-
-    lat_idx = np.clip(lat_idx, 0, static_lookup["nlat"] - 1)
-    lon_idx = np.clip(lon_idx, 0, static_lookup["nlon"] - 1)
-    flat_idx = lat_idx * static_lookup["nlon"] + lon_idx
+    flat_idx = _static_flat_index(p_lat, p_lon, static_lookup)
 
     ef_std = np.take(static_lookup["ef_std_flat"], flat_idx)
     ef_flam = np.take(static_lookup["ef_flam_flat"], flat_idx)
     beta_map = np.take(static_lookup["beta_map_flat"], flat_idx)
     beta_vfei = np.take(static_lookup["beta_vfei_flat"], flat_idx)
-    ef_to_use = np.where(incident_flag == 2, ef_flam, ef_std)
+    ef_to_use = np.where(fire_type == FT_PRESCRIBED, ef_flam, ef_std)   # prescribed -> flaming EF
 
     emis_pm25 = fre * beta_map * ef_to_use * 1e-3
     emis_pm25_vfei = fre * beta_vfei * ef_to_use * 1e-3
@@ -499,7 +560,7 @@ def append_pm25_emissions_to_points(ds_points, static_lookup, debug=False):
         out["EFACTOR_PM25_USED"] = (("point",), ef_to_use.astype(np.float32, copy=False))
         out["EFACTOR_PM25_USED"].attrs.update({
             "units": "g MJ-1",
-            "long_name": "Emission factor selected by incident flag (flaming if flag==2, else standard)",
+            "long_name": "Emission factor selected by FIRE_TYPE (flaming if prescribed (2), else standard)",
             "coordinates": "lat lon time",
         })
         out["BETA_MAP"] = (("point",), beta_map.astype(np.float32, copy=False))
@@ -709,7 +770,7 @@ emissions_debug         = False
 # End user definitions
 # No further modifications needed beyond this point
 # ======================================================================
-code_version = "v0.61"
+code_version = "v0.64"
 if "cove_version" not in globals():
     cove_version = code_version
 # output grid:
@@ -718,7 +779,7 @@ if "cove_version" not in globals():
 # the pre processed land use maps (IGBP)
 bounding_box    = np.array([-135.0, -50.0, 15.0, 55.0])
 # R               = 0.01 # Resolution in degrees
-R               = 0.01
+R               = 0.03
 
 # Paths:
 REPO_DIR    = Path(__file__).resolve().parent
@@ -800,11 +861,12 @@ try:
             "known_incident_type",
             "feature_frp", "feature_detection_duration",
         ]
-        required_cols = [c for c in base_cols if c not in ("feature_frp", "feature_detection_duration")]
+        optional_cols = ("feature_frp", "feature_detection_duration")
+        required_cols = [c for c in base_cols if c not in optional_cols]
         missing_base = [c for c in required_cols if c not in df.columns]
         if missing_base:
             raise ValueError(f"Input CSV is missing required columns: {missing_base}")
-        for optional_col in ("feature_frp", "feature_detection_duration"):
+        for optional_col in optional_cols:
             if optional_col not in df.columns:
                 df[optional_col] = np.nan
         corner_cols = [c for c in (LAT_CORNER_COLS + LON_CORNER_COLS) if c in df.columns]
@@ -831,15 +893,17 @@ try:
             inplace=True
         )
         
-        # Replace values in known_incident_type
-        mapping = {"WF": 1, "RX": 2}
-        df['known_incident_type'] = (
-            df['known_incident_type']
-            .replace("", np.nan)          # treat empty string as NaN
-            .map(mapping)                 # map WF->1, RX->2
-            .fillna(-999)                 # replace NaN with -999
-            .astype(int)                  # make sure column is integer
-        )
+        # Remove non-fire detections (type 2,3,4,7,8), keep confirmed/very likely fires
+        df['type'] = pd.to_numeric(df['type'], errors='coerce')
+        df = df[~df['type'].isin(NON_FIRE_TYPES)].copy()
+        if df.empty:
+            msg(f"All {sat_platform} detections in window were non-fire types {NON_FIRE_TYPES}.")
+            continue
+
+        # Clean incident codes for FIRE_TYPE (assigned after pixel aggregation);
+        # pandas reads 'NULL' as NaN -> ''
+        df['known_incident_type'] = (df['known_incident_type'].fillna("")
+                                     .astype(str).str.strip().str.upper())
         
         # Replace confidence values
         mapping = {"low": 0, "nominal": 1, "high": 2}
@@ -851,9 +915,6 @@ try:
             .astype(int)                  # make sure column is integer
         )
         
-        # Remove type == 3 and 4:
-        df.drop(df[df['type'].isin([3, 4])].index, inplace=True)
-
         # Select detections by static satellite-source mask using original lat/lon.
         df = select_satellite_rows_by_static_mask(df, static_lookup, sat_source_flag=sat_source_flag)
         if df.empty:
@@ -867,6 +928,7 @@ try:
         # Aggregate by hour and original pixel coordinates after static-mask filtering.
         df_window = window_regrid_metrics(detections, bounding_box, R, window_start=start_time)
         df_window = add_grid_cell_area(df_window, R=R, lat_col='latitude', area_col='grid_area')
+        df_window = assign_fire_type(df_window, static_lookup)
         if save_netcdf and not df_window.empty:
             write_window_products_nc(
                 df_window,
